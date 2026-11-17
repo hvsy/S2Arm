@@ -27,7 +27,7 @@ ALLB=("①崩溃 / MARK=不过" "②点都执行到=不过" "③出图满宽=不
 GOOD=("①崩溃 / MARK=过" "②点都执行到=过" "③出图满宽=过" "③b上屏满屏=过" "④3D 镜头比=过")
 MARK='S2A 标记 MARK：帧 100'
 st() { bash "$LS" "$T/a/$1" 2> /dev/null; }
-a() { local s w=$2 k=${3:-}; s=$(st "$1"); ck "A $1：期望 ${w}${k:+（说明含「${k}」）} → 实 ${s:-（空）}" '[ "$(cut -f1 <<< "$s")" = "$w" ] && [[ "$s" == *"$k"* ]]'; }   # ck 里 eval 的 $2 是 ck 自己的参数，期望值走局部变量
+a() { local s w=$2 k=${3:-} r; s=$(st "$1"); r=$?; ck "A $1：期望 ${w}${k:+（说明含「${k}」）} → 实「${s:-（空）}」（rc=${r}）" '[ "$(cut -f1 <<< "$s")" = "$w" ] && [[ "$s" == *"$k"* ]]'; }   # ck 里 eval 的 $2 是 ck 自己的参数，期望值走局部变量
 V "$T/a/wait_load" "${ALLB[@]}"; printf '独占局 宽屏闭环 zz：等实测 CPU 空闲到 40%%（现 12%%）\n🔴 独占局 宽屏闭环 zz：等了 3601 秒，实测 CPU 空闲没到 40%%（现 12%%）；局没起\n' > "$T/a/wait_load/run.out"
 a wait_load 未判 局没起
 V "$T/a/wait_load_old" "${ALLB[@]}"; printf '🔴 独占局 宽屏闭环 smg2：等了 3601 秒，出包没停或负载没降（1 分钟负载 62 / 18 核）；局没起\n' > "$T/a/wait_load_old/run.out"
@@ -117,6 +117,11 @@ bdd "$T/b/hgood" 300 0; for f in ap_mark ap_end; do bimg "$T/b/hgood/$f.png" gra
 ck "B ③c 边际：本局左带空洞约 0.7 < 对照局纯黑（1.0） → 过（实 $(vd "$T/b/hgood" ③c)）" '[ "$(vd "$T/b/hgood" ③c)" = 过 ]'
 bdd "$T/b/hbad" 300 0; for f in ap_mark ap_end; do bimg "$T/b/hbad/$f.png" gray; bimg "$T/b/hbad/base/$f.png" 0; done; CL "$T/b/hbad" > /dev/null
 ck "B ③c 边际负对照：本局左带空洞约 0.7 > 对照局约 0 → 不过（实 $(vd "$T/b/hbad" ③c)）" '[ "$(vd "$T/b/hbad" ③c)" = 不过 ]'
+# B ③c 截图不是加宽图（11-09 哈迪斯 II：Mac 窗口 16:9、2.17:1 画面上下加黑边塞进截图，band_checks 不量，原先记「过」）。期望：两张都是 1280×720 → ③c 未验
+bdd "$T/b/h169" 300 0; for f in ap_mark ap_end; do python3 -c "
+import sys, numpy as np; from PIL import Image
+Image.fromarray(np.random.default_rng(3).integers(40, 220, (720, 1280, 3), dtype=np.uint8)).save(sys.argv[1])" "$T/b/h169/$f.png"; done; CL "$T/b/h169" > /dev/null
+ck "B ③c 截图都是 16:9（不是加宽图）→ 未验，不记过（实 $(vd "$T/b/h169" ③c)）" '[ "$(vd "$T/b/h169" ③c)" = 未验 ]'
 # ── C auto_table.sh（闭环桩）──
 cat > "$T/stub.sh" <<'EOF'
 #!/bin/bash

@@ -105,6 +105,33 @@ class IosPlatform(JobCase):
         self.assertEqual(seen, [["xcodebuild", "-downloadPlatform", "iOS", "-architectureVariant", "arm64"]])   # Apple 芯片只下 arm64 版（8.5 GB，不下 10.6 GB 通用版）
         self.assertEqual([e.get("done") for e in events if "done" in e], [12.5, 100.0])
 
+    def _download_with_exits(self, exits):
+        """假 xcodebuild：按次序给退出码，64 表示不认参数。"""
+        seen = []
+        self.runtimes = [("26.5", "23F77")]
+
+        def run(args, on_line=None, **kw):
+            seen.append([str(a) for a in args])
+            self.c.last_rc = exits[len(seen) - 1]
+            if self.c.last_rc:
+                raise toolchain.Failure("用法帮助", code="tool_exit")
+        with patch.object(self.c, "run", run), patch.object(self.c, "emit", lambda *a, **k: None), \
+             patch.object(toolchain, "probe", self._probe), patch.object(toolchain, "SDK_SIM_MAPPING", self.mapping), \
+             patch.object(toolchain.subprocess, "run", self._run):
+            return seen, toolchain.download_ios_platform(self.c)
+
+    def test_old_xcode_retries_without_architecture_variant(self):
+        seen, result = self._download_with_exits([64, 0])
+        self.assertEqual(seen, [["xcodebuild", "-downloadPlatform", "iOS", "-architectureVariant", "arm64"], ["xcodebuild", "-downloadPlatform", "iOS"]])
+        self.assertEqual(result, {})
+
+    def test_xcode_without_download_support_asks_to_update_not_usage_text(self):
+        with self.assertRaises(toolchain.Failure) as caught:
+            self._download_with_exits([64, 64])
+        self.assertEqual(caught.exception.code, "xcode_sdk_too_old")
+        self.assertIn("Xcode 更新到 26", str(caught.exception))
+        self.assertNotIn("用法", str(caught.exception))
+
     def test_downloaded_but_unregistered_asks_for_recheck(self):
         self.runtimes = [("26.5", "23F77")]
         self.unready = {"23F77"}
@@ -137,6 +164,77 @@ class IosPlatform(JobCase):
         self.assertEqual([e["unit"] for e in got], ["B", "B"])
         self.assertAlmostEqual(got[0]["done"], 1.02e9); self.assertAlmostEqual(got[0]["total"], 8.32e9)
         self.assertAlmostEqual(got[-1]["done"], 8.32e9)
+
+    def _progress_events(self, lines, download=toolchain.download_ios_platform):
+        events = []
+
+        def run(args, on_line=None, **kw):
+            for text in lines:
+                on_line(text)
+
+        with patch.object(self.c, "run", run), patch.object(self.c, "emit", lambda *a, **k: events.append(k)), \
+             patch.object(toolchain, "_sdk_platform", return_value=(False, "", "")), \
+             patch.object(toolchain, "_wait_runtime_ready", return_value=True):
+            download(self.c)
+        return [e for e in events if "done" in e]
+
+    def test_download_progress_decimal_comma_reports_bytes(self):
+        for separator in (".", ","):
+            for space in (" ", "\u00a0", "\u202f"):
+                with self.subTest(separator=separator, space=space):
+                    lines = [f"Downloading iOS Simulator: 46{separator}2{space}% (3{separator}63 GB of 7{separator}85 GB)",
+                             f"Downloading iOS Simulator: 47{separator}1{space}% (3{separator}7 GB of 7{separator}85 GB)"]
+                    got = self._progress_events(lines)
+                    self.assertEqual(len(got), 2)
+                    self.assertEqual([e["unit"] for e in got], ["B", "B"])
+                    self.assertAlmostEqual(got[0]["done"], 3.63e9)
+                    self.assertAlmostEqual(got[1]["done"], 3.7e9)
+                    self.assertAlmostEqual(got[0]["total"], 7.85e9)
+                    self.assertAlmostEqual(got[1]["total"], 7.85e9)
+
+    def test_download_progress_decimal_comma_percentage_only(self):
+        got = self._progress_events(["Downloading: 46,2%", "Downloading: 47,1\u00a0%", "Downloading: 100%"])
+        self.assertEqual([e["done"] for e in got], [46.2, 47.1, 100.0])
+        self.assertEqual([e["total"] for e in got], [100.0] * 3)
+        self.assertEqual([e["unit"] for e in got], ["%"] * 3)
+
+    def test_metal_download_progress_decimal_comma(self):
+        got = self._progress_events(["Downloading: 46,2%", "Downloading: 47,1\u00a0%", "Downloading: 100%"],
+                                    toolchain.download_metal)
+        self.assertEqual([e["done"] for e in got], [46.2, 47.1, 100.0])
+        self.assertEqual([e["unit"] for e in got], ["%"] * 3)
+
+    def _metal_download_fails(self, tail):
+        """xcodebuild -downloadComponent 退出 70、日志末尾是 tail（诊断#f5eae9 三件的原文）→ 返回 download_metal 抛出的 Failure"""
+        log = self.root / "dl.log"; log.write_text("Beginning asset download...\n" + tail, encoding="utf-8")
+        def run(args, on_line=None, **kw):
+            self.c.last_log = log
+            raise Failure("下载 Metal 编译组件失败（退出码 70）：})", code="tool_exit")
+        with patch.object(self.c, "run", run), patch.object(self.c, "emit", lambda *a, **k: None):
+            with self.assertRaises(Failure) as e:
+                toolchain.download_metal(self.c)
+        return e.exception
+
+    def test_metal_catalog_unreachable_gets_own_code(self):
+        # 期望手写：两台 Mac（Xcode 27A266a / 27B47）原文「Failed fetching catalog … MetalToolchain」→ 码 metal_download_unreachable，
+        #   上屏一句说「连不上苹果的组件服务器」，下一步里有 -importComponent 手动导入的办法；不再是「})」
+        for build in ("27A266a", "27B47"):
+            with self.subTest(build=build):
+                f = self._metal_download_fails("xcodebuild: error: Failed fetching catalog for assetType (com.apple.MobileAsset.MetalToolchain), "
+                                               "serverParameters ({\n    RequestedBuild = %s;\n})\n" % build)
+                self.assertEqual(f.code, "metal_download_unreachable")
+                self.assertIn("连不上苹果的组件服务器", str(f)); self.assertNotIn("})", str(f))
+                self.assertIn("-importComponent MetalToolchain", RECOVERY["metal_download_unreachable"])
+
+    def test_metal_download_xcode_plugin_broken_is_first_launch(self):
+        # 期望手写：一台 Mac 原文「xcodebuild failed to load a required plug-in … -runFirstLaunch」（CoreSimulator 没装上）→ 码 xcode_setup_required
+        f = self._metal_download_fails("Library not loaded: /Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/CoreSimulator\n"
+                                       "xcodebuild failed to load a required plug-in. Ensure your system frameworks are up-to-date by running 'xcodebuild -runFirstLaunch'\n")
+        self.assertEqual(f.code, "xcode_setup_required")
+
+    def test_metal_download_unknown_failure_unchanged(self):
+        # 期望手写：日志里没有认得的字样 → 原样抛 tool_exit，不猜
+        self.assertEqual(self._metal_download_fails("something else went wrong\n").code, "tool_exit")
 
     def test_registration_error_does_not_redo_transfer_when_runtime_ready(self):
         def run(args, on_line=None, until=None, **kw):

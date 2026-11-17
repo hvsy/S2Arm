@@ -7,7 +7,10 @@ KEY_LINE = re.compile(r'(?im)^(?P<prefix>[ \t]*[A-Za-z0-9_.-]+[ \t]*=[ \t]*)(?P<
 SECRET = re.compile(r'(?i)(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|serial(?:number)?|udid|uuid|imei|device[_-]?id|android[_-]?id|idfa|idfv|mac[_-]?address|uniqueidentifier|identifierforvendor|tester|(?:^|[_-])keys?(?:[_-]|$)|(?:^|[_-])(?:kek|bek|seed|keyblob)(?:[_-]|$)|titlekek|masterkey|headerkey)')
 
 # Scan keys separately so an innocent outer field cannot hide a nested secret assignment.
-ASSIGNMENT_KEY = re.compile(r"""["']?(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)["']?[^\S\r\n]*[:=][^\S\r\n]*""")
+# 名字只从一串 [A-Za-z0-9_.-] 的开头试（前面的数字 / 点 / 横线由 [0-9.-]* 吃掉，名字仍从串里第一个字母或下划线起）：原写法从串里每个位置起
+#   都把名字吞到串尾再回退，长串（40 KB 的一行日志、base64）上是平方级，40 KB 一行脱敏 18 秒、诊断导出单测 96 秒（11-14 门禁提速）。
+#   结果不变：名字后面必须紧跟引号 / 空白 / [:=]，从串里任何位置起名字都只能在串尾结束，最左匹配本来就落在串里第一个字母或下划线上
+ASSIGNMENT_KEY = re.compile(r"""["']?(?<![A-Za-z0-9_.-])[0-9.-]*(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)["']?[^\S\r\n]*[:=][^\S\r\n]*""")
 
 
 def redact_assignments(text):
@@ -80,7 +83,9 @@ IDENTITY_RULES = (
 )
 DEVICE_CONTEXT = re.compile(r'(?i)\b(?:udid|device|serial)\b')
 LEGACY_UDID = re.compile(r'(?i)(?<![A-Z0-9])[A-F0-9]{40}(?![A-Z0-9])')
-DEVICE_NAME = re.compile(r'''[^\s"'<>:=,;{}\[\]，。]+的(iPhone|iPad)''')
+# 只在一串非分隔字符的开头试（前面不是同类字符）：原写法从串里每个位置起都往后吞到底再回退，长串（长 JSON 值、零字节）上是平方级——
+#   4 MiB 的任务记录脱敏要几分钟（#917）。结果不变：最左匹配本来就从串首开始
+DEVICE_NAME = re.compile(r'''(?<![^\s"'<>:=,;{}\[\]，。])[^\s"'<>:=,;{}\[\]，。]+的(iPhone|iPad)''')
 
 
 def redact_identity(text):
@@ -90,6 +95,34 @@ def redact_identity(text):
     text = re.sub(r'[^\r\n]+', lambda match: LEGACY_UDID.sub('[DEVICE_ID]', match[0])
                   if DEVICE_CONTEXT.search(match[0]) else match[0], text)
     return DEVICE_NAME.sub(r'[DEVICE_NAME]的\1', text)
+
+
+def _private_path(match):
+    """路径换成占位；Windows 路径保留长度和层数（不含内容），WinError 206 这类问题要靠它分清是不是路径太长"""
+    path = match.group(0).replace('\\\\', '\\')
+    if '\\' not in path:
+        return '[PRIVATE_PATH]'
+    return f"[PRIVATE_PATH len={len(path)} depth={path.count(chr(92))}]"
+
+
+# 系统错误原文（strerror）：路径匹配会一直吞到行尾（路径本身可能带空格，不能按空白截断），「cp: <路径>: Operation not permitted」的原因
+#   原先跟着路径一起变成 [PRIVATE_PATH]，玩家诊断里看不出是没权限、没空间还是文件不在（11-09 01007EF00011E000拷字体失败 7 行全是这样）。
+#   只认这张表里的原文（不收任意尾巴，免得把路径里冒号后的名字漏出去）：末尾是「: 原文」就只换前面的路径
+ERRNO_REASONS = ("Operation not permitted", "Permission denied", "No such file or directory", "File exists", "Read-only file system",
+                 "No space left on device", "Is a directory", "Not a directory", "Input/output error", "Resource busy", "Device not configured",
+                 "File name too long", "Too many open files", "Disc quota exceeded", "Bad file descriptor", "Directory not empty", "Invalid argument",
+                 "Cross-device link", "Operation not supported", "Operation timed out", "Resource deadlock avoided", "Resource temporarily unavailable",
+                 "Too many levels of symbolic links", "Bad address", "Result too large")
+# macOS cp -c 在系统错误前还带系统调用名（#290：「…bfttf: clonefile failed: Cross-device link」），一起保留
+_REASON_TAIL = re.compile(r'(?i): (?:(?:clonefile|fclonefileat|copyfile) failed: )?(?:' + '|'.join(map(re.escape, ERRNO_REASONS)) + r')\.?[ \t]*$')
+
+
+def _private_path_keep_reason(match):
+    text = match.group(0)
+    tail = _REASON_TAIL.search(text)
+    if not tail or tail.start() == 0:
+        return _private_path(match)
+    return _private_path(re.match(r'.*', text[:tail.start()], re.S)) + text[tail.start():]
 
 
 def redact_text(text, *, key_values=None, preserve_identity=False) -> str:
@@ -103,10 +136,11 @@ def redact_text(text, *, key_values=None, preserve_identity=False) -> str:
     s = re.sub(r'(?im)(authorization\s*[:=]\s*)[^\r\n]+', r'\1[REDACTED]', s)
     s = re.sub(r'(?i)(https?://)[^/\s:@]+:[^/\s@]+@', r'\1[REDACTED]@', s)
     s = re.sub(r'(?i)([?&](?:token|key|api_key|secret|password|auth|signature|session|access_token)=)[^&#\s]+', r'\1[REDACTED]', s)
-    s = re.sub(r'(?i)((?:password|passwd|secret|token|api[_-]?key|[a-z0-9_]*_key(?:_[a-z0-9]+)*|titlekek|masterkey|headerkey|cookie|serial(?:number)?|udid|uuid|imei|device[_-]?id|android[_-]?id|idfa|idfv|mac[_-]?address|uniqueidentifier|identifierforvendor)\s*["\x27]?\s*[:=]\s*["\x27]?)[^\s,"\x27;}]+', r'\1[REDACTED]', s)
+    # [a-z0-9_]*_key 只从一串 [a-z0-9_] 的开头试（同上 ASSIGNMENT_KEY：串中间起能成的，从串头起也成、且更靠左，原本就轮不到它；原写法长串上平方级）
+    s = re.sub(r'(?i)((?:password|passwd|secret|token|api[_-]?key|(?<![a-z0-9_])[a-z0-9_]*_key(?:_[a-z0-9]+)*|titlekek|masterkey|headerkey|cookie|serial(?:number)?|udid|uuid|imei|device[_-]?id|android[_-]?id|idfa|idfv|mac[_-]?address|uniqueidentifier|identifierforvendor)\s*["\x27]?\s*[:=]\s*["\x27]?)[^\s,"\x27;}]+', r'\1[REDACTED]', s)
     s = redact_identity(s)
-    s = re.sub(r'(?:/Volumes/|/private/var/|/var/mobile/|/data/user/|/data/data/|\\\\)[^\r\n\"\x27<>]*', '[PRIVATE_PATH]', s)
-    s = re.sub(r'(?:/Users/|/home/|[A-Za-z]:[\\/](?:Users|Documents)[\\/])[^\r\n\"\x27<>]*', '[PRIVATE_PATH]', s)
+    s = re.sub(r'(?:/Volumes/|/private/var/|/var/mobile/|/data/user/|/data/data/|\\\\)[^\r\n\"\x27<>]*', _private_path_keep_reason, s)
+    s = re.sub(r'(?:/Users/|/home/|[A-Za-z]:[\\/](?:Users|Documents)[\\/])[^\r\n\"\x27<>]*', _private_path_keep_reason, s)
     s = re.sub(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b', '[DEVICE_ID]', s)
     if not preserve_identity:
         s = re.sub(r'(?i)\b[0-9a-f]{64,}\b', '[KEY_MATERIAL]', s)

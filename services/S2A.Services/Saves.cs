@@ -19,7 +19,7 @@ namespace S2A.Services
     // 每个子目录的内容 = 游戏挂载存档后看到的根目录。起局时（游戏跑之前）经 LibHac 挂上对应存档、清空、整棵拷入、提交——
     // Ryujinx 数据根跨局复用，不清空会读到上一局的自动存档。没给 S2A_SAVE_DIR 时不动存档（沿用数据根里已有的）。
     // 不认识的子目录、该游戏没有的存档类型、拷入失败一律报红。
-    //   user      → 文件：建档时的用户号（32 位十六进制，同 Ryujinx Profiles.json 的 user_id）。游戏把用户号记在存档里（动森岛民按它认人），
+    //   user      → 文件：建档时的用户号（32 位十六进制，同 Ryujinx Profiles.json 的 user_id）。游戏把用户号记在存档里（01006F8002326000岛民按它认人），
     //               对不上会当新玩家走开场；有这个文件就以它为当前用户（EnsureSaveData 之前，账号存档也按它建）
     public static class Saves
     {
@@ -87,28 +87,41 @@ namespace S2A.Services
                 return;
             }
 
-            HorizonClient hc = device.System.LibHacHorizonManager.RyujinxClient;
-            ApplicationId app = new(programId);
-
+            var sources = new System.Collections.Generic.List<(string kind, string dir)>();
             foreach (string sub in Directory.EnumerateDirectories(root))
             {
                 string kind = Path.GetFileName(sub);
-                Result r;
+                if (kind is "device" or "account") sources.Add((kind, sub));
+                else Red.Report("S2A_SAVE_DIR 下不认识的存档类型目录（只认 device / account；用户号放 user 文件）", sub);
+            }
+            SeedFrom(device, programId, sources);
+        }
 
-                switch (kind)
+        // 种入内核（S2A_SAVE_DIR 与存档位置 SaveData 共用，见 SaveFolder.cs）：每项 (类型, 目录)，目录内容 = 游戏挂载存档后看到的根目录。
+        //   类型 account / device；save = 有账号存档写账号存档，这款只有设备存档就写设备存档（NX2Apple 引擎的 save/ 规矩，存档位置也用它）。
+        //   清空 → 整棵拷入 → 提交；拷入或提交失败抛 InvalidOperationException（本次起局失败，已提交的旧档原样）
+        internal static void SeedFrom(Switch device, ulong programId, System.Collections.Generic.IEnumerable<(string kind, string dir)> sources)
+        {
+            HorizonClient hc = device.System.LibHacHorizonManager.RyujinxClient;
+            ApplicationId app = new(programId);
+            int total = 0, done = 0;
+
+            foreach ((string kind0, string sub) in sources)
+            {
+                total++;
+                string kind = kind0;
+                Result r;
+                var u = device.System.AccountManager.LastOpenedUser.UserId;
+                // 走 Shim 里有实现的重载（Ncm.ApplicationId + Fs.UserId → MountSaveDataImpl，类型 Account，同 Ryujinx IFileSystemProxy.OpenSaveDataFileSystem 的路子）；
+                //   LibHac.Fs.SaveData 里收 Account.Uid 的两个重载是 throw NotImplementedException（0.21.0-alpha.133），10-20 一款第一方动作冒险游戏带账号存档起局 S2A_Init 当场失败
+                Result Account() => LibHac.Fs.Shim.SaveData.MountSaveData(hc.Fs, "s2asave"u8, new LibHac.Ncm.ApplicationId(programId), new LibHac.Fs.UserId((ulong)u.High, (ulong)u.Low));
+
+                if (kind == "device") r = hc.Fs.MountDeviceSaveData("s2asave"u8, app);
+                else if (kind == "account") r = Account();
+                else
                 {
-                    case "device":
-                        r = hc.Fs.MountDeviceSaveData("s2asave"u8, app);
-                        break;
-                    case "account":
-                        // 走 Shim 里有实现的重载（Ncm.ApplicationId + Fs.UserId → MountSaveDataImpl，类型 Account，同 Ryujinx IFileSystemProxy.OpenSaveDataFileSystem 的路子）；
-                        //   LibHac.Fs.SaveData 里收 Account.Uid 的两个重载是 throw NotImplementedException（0.21.0-alpha.133），10-20 塞尔达带账号存档起局 S2A_Init 当场失败
-                        var u = device.System.AccountManager.LastOpenedUser.UserId;
-                        r = LibHac.Fs.Shim.SaveData.MountSaveData(hc.Fs, "s2asave"u8, new LibHac.Ncm.ApplicationId(programId), new LibHac.Fs.UserId((ulong)u.High, (ulong)u.Low));
-                        break;
-                    default:
-                        Red.Report("S2A_SAVE_DIR 下不认识的存档类型目录（只认 device / account；用户号放 user 文件）", sub);
-                        continue;
+                    r = Account(); kind = "account";
+                    if (r.IsFailure()) { r = hc.Fs.MountDeviceSaveData("s2asave"u8, app); kind = "device"; }
                 }
 
                 if (r.IsFailure())
@@ -117,6 +130,7 @@ namespace S2A.Services
                     continue;
                 }
 
+                // 清空后拷入或提交失败：不提交（已提交的旧档原样留着），本次起局失败（审计 P2-176：原先只报红照样开局）
                 try
                 {
                     r = hc.Fs.CleanDirectoryRecursively("s2asave:/"u8);
@@ -133,12 +147,13 @@ namespace S2A.Services
                         if (r.IsSuccess())
                         {
                             Console.Error.WriteLine($"S2A 带存档起局：{kind} ← {sub}（{files} 个文件，{bytes} 字节）");
+                            done++;
                         }
                     }
 
                     if (r.IsFailure())
                     {
-                        Red.Report($"带存档起局：写入 {kind} 存档失败", r.ToStringWithName());
+                        throw new InvalidOperationException($"带存档起局：写入 {kind} 存档失败：{r.ToStringWithName()}");
                     }
                 }
                 finally
@@ -146,7 +161,16 @@ namespace S2A.Services
                     hc.Fs.Unmount("s2asave"u8);
                 }
             }
+
+            // 每一类都灌进去了才打这一行（审计 P1-156）：作业层只认它才删待放入的种子；有一类挂不上（上面 continue）就不打，种子留到下次
+            if (total > 0 && done == total)
+            {
+                Console.Error.WriteLine($"{SeedAllDoneLine}{done} 类全部灌入");
+            }
         }
+
+        // 作业层 pack/jobs/saves.py SEED_DONE_LINE 认这一句（两边要一字不差）
+        internal const string SeedAllDoneLine = "S2A 带存档起局完成：";
 
         // 存档点副本（录手柄，见 ios/vpad.m）：把本游戏此刻已提交的存档整份拷到 dir，布局同 S2A_SAVE_DIR（account/ device/ + user），回放局直接拿来带存档起局。
         //   读 Ryujinx 数据根里目录存档的已提交副本 bis/user/save/<存档号>/0（Commit 返回后即是提交态），不再挂载游戏正开着的存档。
@@ -234,10 +258,12 @@ namespace S2A.Services
                         string save = Path.Combine(Ryujinx.Common.Configuration.AppDataManager.BaseDirPath, "bis", "user", "save", info.SaveDataId.ToString("x16"));
                         string src = Path.Combine(save, "0");
 
+                        // 缺一类已提交目录：整次副本失败、旧副本也不留（审计 P2-22：原先 continue 后照样换上只含另一类的副本）
                         if (!Directory.Exists(src))
                         {
                             Red.Report($"存档点副本：{kind} 存档 {info.SaveDataId:x16} 没有已提交目录", src);
-                            continue;
+                            Discard(tmp, dir);
+                            return 0;
                         }
 
                         string dst = Path.Combine(tmp, kind);
@@ -262,7 +288,7 @@ namespace S2A.Services
                     }
                 }
 
-                // 一种存档都没拷成（都没有已提交目录，或这款没有存档）：不换上只有 user 的空副本（11-01 18:00 全量审计 P2-22）
+                // 一种存档都没有（这款没有存档）：不换上只有 user 的空副本（11-01 18:00 全量审计 P2-22）
                 if (kinds == 0)
                 {
                     Discard(tmp, dir);
@@ -309,6 +335,8 @@ namespace S2A.Services
             }
         }
 
+        // 种子拷入：只收普通文件和目录，碰到链接整次失败（审计 P2-194，同 SaveTransfer.Scan 的「不跟链接」判断）；
+        //   按 1 MB 块写，不整文件进内存（审计 P2-176）
         private static Result CopyIn(HorizonClient hc, string hostDir, string savePath, out int files, out long bytes)
         {
             files = 0;
@@ -316,6 +344,7 @@ namespace S2A.Services
 
             foreach (string d in Directory.EnumerateDirectories(hostDir))
             {
+                NoLink(d);
                 string p = savePath + "/" + Path.GetFileName(d);
                 Result r = hc.Fs.CreateDirectory(U8(p));
 
@@ -334,11 +363,15 @@ namespace S2A.Services
                 }
             }
 
+            byte[] chunk = new byte[1 << 20];
+
             foreach (string f in Directory.EnumerateFiles(hostDir))
             {
-                byte[] data = File.ReadAllBytes(f);
+                NoLink(f);
+                using FileStream src = new(f, FileMode.Open, FileAccess.Read, FileShare.Read, 1, FileOptions.SequentialScan);
+                long length = src.Length;
                 byte[] p = U8(savePath + "/" + Path.GetFileName(f));
-                Result r = hc.Fs.CreateFile(p, data.Length);
+                Result r = hc.Fs.CreateFile(p, length);
 
                 if (r.IsFailure())
                 {
@@ -352,8 +385,35 @@ namespace S2A.Services
                     return r;
                 }
 
-                r = hc.Fs.WriteFile(h, 0, data, WriteOption.Flush);
-                hc.Fs.CloseFile(h);
+                try
+                {
+                    long offset = 0;
+
+                    while (offset < length)
+                    {
+                        int n = src.Read(chunk, 0, (int)Math.Min(chunk.Length, length - offset));
+
+                        if (n == 0)
+                        {
+                            throw new IOException($"带存档起局：种子文件读到一半变短（{offset}/{length} 字节）：{f}");
+                        }
+
+                        r = hc.Fs.WriteFile(h, offset, chunk.AsSpan(0, n), WriteOption.None);
+
+                        if (r.IsFailure())
+                        {
+                            return r;
+                        }
+
+                        offset += n;
+                    }
+
+                    r = hc.Fs.FlushFile(h);
+                }
+                finally
+                {
+                    hc.Fs.CloseFile(h);
+                }
 
                 if (r.IsFailure())
                 {
@@ -361,10 +421,18 @@ namespace S2A.Services
                 }
 
                 files++;
-                bytes += data.Length;
+                bytes += length;
             }
 
             return Result.Success;
+        }
+
+        private static void NoLink(string path)
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new InvalidOperationException($"带存档起局：种子里有链接，拒绝拷入：{path}");
+            }
         }
 
         // LibHac 路径要 NUL 结尾的 UTF-8

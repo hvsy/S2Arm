@@ -1,6 +1,8 @@
 // 游戏内提示条（iOS；文案在 s2a_direct_prompt.h，Mac 同款在 macos/front_mac.m）：存档不能原子提交、签名快到期（prov_expiry.m，描述文件剩不到 48 小时）等。
 //   贴画面顶部居中（两侧肩键之间），只占自己那一块，别处的触摸照常给游戏和虚拟手柄；带两个按钮的 seconds 秒没理会按「否」收起。
 #import <UIKit/UIKit.h>
+#import "tv_compat.h"
+#import "s2a_l10n.h"
 #import <GameController/GameController.h>
 #include "s2a_direct_prompt.h"
 #include "native.h"
@@ -27,7 +29,7 @@ static void answer(BOOL accept) { void (^cb)(BOOL) = g_onAnswer; g_onAnswer = ni
 // accept 为 nil = 只有「知道了」的确认条
 static void show(NSString *title, NSString *body, NSString *accept, NSString *decline, double seconds) {
     g_title.text = title; g_title.hidden = title.length == 0; g_body.text = body;
-    [g_accept setTitle:accept ?: @(S2A_DPROMPT_OK) forState:UIControlStateNormal];
+    [g_accept setTitle:accept ?: S2APICK(S2A_DPROMPT_OK) forState:UIControlStateNormal];
     [g_decline setTitle:decline forState:UIControlStateNormal]; g_decline.hidden = accept == nil;
     g_banner.hidden = NO; [g_banner.superview bringSubviewToFront:g_banner]; NSInteger gen = ++g_gen;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -35,7 +37,14 @@ static void show(NSString *title, NSString *body, NSString *accept, NSString *de
 }
 static void poll(void) {
     // 存档不能原子提交（审计 P2-45，Mac 同款判定 runtime/src/direct_prompt.c）：第一次读到非 0 时用这条横幅提示一次
-    if (s2a_save_atomic_poll()) s2a_dprompt_notice(@S2A_DPROMPT_SAVE_ATOMIC_TITLE, @S2A_DPROMPT_SAVE_ATOMIC_IOS, 0, 15);
+    if (s2a_save_atomic_poll()) s2a_dprompt_notice(S2APICK(S2A_DPROMPT_SAVE_ATOMIC_TITLE), S2APICK(S2A_DPROMPT_SAVE_ATOMIC_IOS), 0, 15);
+    // 画面没出来（体验梳理线 11-14：直连现编全失败、起局 20 秒一次绘制都没画）：游戏上方横幅，不挡游戏；「故障报修」走现有报修（诊断包带上现编失败次数那行日志），
+    //   「知道了」收起；一局只提示一次（s2a_no_picture_poll 只返回一次 1）
+    if (s2a_no_picture_poll()) {
+        void s2a_diag_report(void);   // ios/diag.m
+        g_onAnswer = ^(BOOL report) { if (report) s2a_diag_report(); };
+        show(S2APICK(S2A_DPROMPT_NOPIC_TITLE), S2APICK(S2A_DPROMPT_NOPIC_BODY), S2AL(@"diag.report.title"), S2APICK(S2A_DPROMPT_OK), 60);
+    }
 }
 
 static UIButton *button(SEL action, BOOL primary) {
@@ -46,7 +55,7 @@ static UIButton *button(SEL action, BOOL primary) {
 }
 // 游戏画面建好后调（app.m 场景代理，提示页不调）
 void s2a_dprompt_attach(UIView *root) {
-    g_banner = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+    g_banner = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:S2A_BLUR_MATERIAL_DARK]];
     g_banner.layer.cornerRadius = 16; g_banner.clipsToBounds = YES; g_banner.hidden = YES; g_banner.translatesAutoresizingMaskIntoConstraints = NO;
     g_title = [UILabel new]; g_title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold]; g_title.textColor = UIColor.whiteColor;
     g_body = [UILabel new]; g_body.font = [UIFont systemFontOfSize:14]; g_body.textColor = [UIColor colorWithWhite:1 alpha:0.75]; g_body.numberOfLines = 0;
@@ -66,9 +75,9 @@ void s2a_dprompt_attach(UIView *root) {
     double h = s2a_prov_hours_left_self();
     if (!isnan(h) && h < 48) {
         LOG("签名到期提示：描述文件还剩 %.1f 小时", h);
-        NSString *left = h < 1 ? @"不到 1 小时" : [NSString stringWithFormat:@"约 %d 小时", (int)h];
+        NSString *left = h < 1 ? S2AL(@"dprompt.expiry.lessThanHour") : [NSString stringWithFormat:S2AL(@"dprompt.expiry.hours"), (int)h];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            if (g_banner.hidden) show(@"签名快到期了", [NSString stringWithFormat:@"还剩%@。到期后游戏打不开，存档不会丢：连上手机再点一次「装到 iPhone」，或在 AltStore 里刷新。", left], nil, nil, 15); });
+            if (g_banner.hidden) show(S2AL(@"dprompt.expiry.title"), [NSString stringWithFormat:S2AL(@"dprompt.expiry.body"), left], nil, nil, 15); });
     }
     // Switch 2 Pro 手柄缺省不连（每 App 开关，开了才扫蓝牙）：从没设过这个开关、起局 20 秒还没有任何系统认得的手柄时，说一次去哪开（审计 P2-4）。
     //   只提示一次（S2ANS2ProHintShown）；自动化局不提示（s2a_unattended，日志由工具拉回）
@@ -77,10 +86,17 @@ void s2a_dprompt_attach(UIView *root) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             if (GCController.controllers.count || [u objectForKey:@"S2ANS2ProAdapterEnabled"]) return;
             [u setBool:YES forKey:@"S2ANS2ProHintShown"];
-            s2a_dprompt_notice(@"用 Switch 2 Pro 手柄？", @"四指长按屏幕 1.5 秒打开设置，打开「启用 Switch 2 Pro 手柄」，再按手柄上的配对键。", 0, 12); });
+            s2a_dprompt_notice(S2AL(@"dprompt.ns2pro.title"), S2AL(@"dprompt.ns2pro.body"), 0, 12); });
 }
 
 // 只有「知道了」的提示条（别的模块用，主线程）：delay 秒后显示；横幅正被别的提示占着就再等 5 秒，不顶掉（审计 P2-3 IML 权限丢失）
+// C 入口（runtime/src/ap_host.c 停帧救场经 dlsym 调，任意线程）：「标题\n\n正文」拆开交 s2a_dprompt_notice，显示 seconds 秒
+void s2a_ios_banner(const char *m, double seconds) {
+    if (!m) return;
+    NSString *s = @(m); NSRange r = [s rangeOfString:@"\n"];
+    NSString *t = r.location == NSNotFound ? s : [s substringToIndex:r.location], *b = r.location == NSNotFound ? @"" : [[s substringFromIndex:r.location] stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet];
+    s2a_dprompt_notice(t, b, 0, seconds);
+}
 void s2a_dprompt_notice(NSString *title, NSString *body, double delay, double seconds) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!g_banner) return;

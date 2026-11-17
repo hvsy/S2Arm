@@ -28,13 +28,12 @@ source "$R/tools/cores.sh"; s2a_cores || exit 1; source "$R/tools/progress.sh"  
 SIGN=${S2A_SIGN:-dev}; case $SIGN in dev|adhoc|none) ;; *) echo "【红】S2A_SIGN 只认 dev / adhoc / none"; exit 1;; esac   # none = 不签（交给侧载工具签，Windows 出包用）
 [ "$SIGN" != dev ] && [ $REG = 1 ] && { echo "【红】${SIGN} 包不登记调度（测试设备只装开发直签包）"; exit 1; }
 TEAM=${S2A_TEAM:-${S2A_TEAM_DEFAULT:-}}; [ -n "$TEAM" ] || [ "$SIGN" != dev ] || { echo "【红】没设 S2A_TEAM（复制 tools/machine.local.example 为 tools/machine.local 并填写签名团队）"; exit 1; }
-C=$(git -C "$R" rev-parse --short=9 HEAD) || exit 1
+source "$H/stage_keyfiles.sh"; C=$(src_commit9 "$R") || exit 1   # 发布快照没有 .git：读 engine.json 里打包时记下的提交号
 # 源码树干净才出（包号里的提交号要对得上源码）：防开发者用改了没提交的树出包。发布快照（App 内置引擎，根有 engine.json 清单）
-#   安装时已按清单逐文件核过 sha256、玩家机上没人改它，这条在玩家路径上没有意义，不判（11-02 维护者；beta.3 走查：快照缺
-#   根 .gitignore 时编译产物被当改动，玩家导出 iPhone 版全红——.gitignore 已补进快照，作第二道）
+#   安装时已按清单逐文件核过 sha256、玩家机上没人改它，这条在玩家路径上没有意义，不判（11-02 维护者）；快照也不再带 .git，没有可比的提交
 src_dirty() { [ -f "$1/engine.json" ] && return 1; [ -n "$(git -C "$1" status --porcelain -- runtime ios graphics translator services compat Makefile)" ]; }
 src_dirty "$R" && { echo "【红】本树构建相关目录有未提交改动，包版本对不上提交号，不出"; exit 1; }
-# 同一产物根、同款、同提交只许一份在出（10-20 20:5x 我手出与自动正式局同时出动森 c85d1335a，两份抢 CPU）：后到的等先到的出完，
+# 同一产物根、同款、同提交只许一份在出（10-20 20:5x 我手出与自动正式局同时出01006F8002326000 c85d1335a，两份抢 CPU）：后到的等先到的出完，
 #   再走下面的正常流程——先到的已写好包键，后到的命中「现行已是包」直接登记，复用它的结果
 #   锁是内核文件锁（tools/plock.sh，审计 P1-27：原先 mkdir 锁目录后才写 pid，空 pid 当死锁删、两个等待者可按旧读数删掉新锁）
 PL=${S2A_PACK_LOCKS:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/pack_lock}/$G@$C@$(printf %s "$S2A_ROOTS" | cksum | cut -d' ' -f1).lock
@@ -64,7 +63,7 @@ TL0=$(mktemp)
 if [ -n "${S2A_REFRESHED:-}" ] && [ "$S2A_REFRESHED" = "$(basename "$(root_cur "$G")")" ]; then echo "🟢 $G 调用方刚刷过产物根（现行 ${S2A_REFRESHED}），不再刷新"; rfc=0
 else TM "刷新各阶段（键核对 / 跳过）" "$TL0" -- bash "$H/refresh.sh" "$G"; rfc=$?; fi
 [ $rfc = 0 ] || { echo "【红】$G 现行产物根刷不到本树的阶段键，不出包"; rm -f "$TL0"; exit 1; }   # 产物根落后于代码树（如着色器翻译器换了版本）就先重出对应阶段
-# 宽屏表：refresh.sh 改写段一过就在后台起掌机档自动出表（与着色器 / 直连库并行）。出包不等它（10-25 维护者：巫师3 等了 573 秒、动森 713 秒，表还没出成；
+# 宽屏表：refresh.sh 改写段一过就在后台起掌机档自动出表（与着色器 / 直连库并行）。出包不等它（10-25 维护者：巫师3 等了 573 秒、01006F8002326000 713 秒，表还没出成；
 #   维护者 要出包快，宽屏表晚一包生效可以接受）：已收尾 → 表在下面拷进本包；还在跑 → 本包用仓库表、没有就这一档位不带表（16:9 居中留黑边，不拉伸），
 #   后台照跑，出好的表下一个包按同一构建号带上。确需等它显式设 S2A_WIDEN_WAIT_S=<秒>。主机档照旧后台出、下一个包带上。S2A_WIDEN_AUTO_RUN=0 两档都不出
 TM 等宽屏 "$TL0" -- bash "$R/graphics/widen/scan/auto_pkg.sh" wait "$G" handheld "${S2A_WIDEN_WAIT_S:-0}"
@@ -89,10 +88,8 @@ DN=$("${S2A_PY:-python3}" "$H/display_name.py" "$CUR" --suffix "$DSUF") || { ech
 DT=$("${S2A_PY:-python3}" "$H/display_name.py" "$CUR" --title) || { rm -f "$TL0"; exit 1; }   # 游戏名单独写进 Info.plist（S2AGameTitle）：装机时加后缀（pack/jobs/install.py）同一函数拼
 PK=$(ipa_pkg_key "$C$([ "$SIGN" = dev ] || echo " sign=$SIGN")${S2A_BUNDLE_ID:+ bid=$BID} dn=$DN$([ "${ALLCAPS:-0}" = 1 ] && echo " allcaps")$([ "${NATIVE:-0}" = 1 ] && echo " native")" "$CUR" "$G") || exit 1   # 资源输入键算不出 = 失败（ipa_key.sh 已报红），不拿缺项的键去比
 [ -z "$SIKEY" ] || PK="$PK save=$SIKEY"
-# 登记前核管线归档（10-21 维护者：归档 0 KB 的包判红、不登记，免得调度把首遇全现编的包装上测试设备 / 给 维护者）
 # 登记说明带上没解出的追加内容（审计 P2-30：解不出不拦本体，但不许静默算全绿）
-reg() { local an; root_pso0_gate "$(dirname "$1")" "$G" || return 1; an=$(root_aoc_note "$(dirname "$1")"); an=${an#；}
-  if root_pso0 "$(dirname "$1")" > /dev/null; then S2A_PKG_NOTE="例外：归档 0 KB，${S2A_ALLOW_PSO0}${an:+；$an}" bash "$S2A_PRIVATE_TOOLS/sched.sh" pkg "$G" "$1" "$C"; else S2A_PKG_NOTE=$an bash "$S2A_PRIVATE_TOOLS/sched.sh" pkg "$G" "$1" "$C"; fi; }
+reg() { local an; an=$(root_aoc_note "$(dirname "$1")"); an=${an#；}; S2A_PKG_NOTE=$an bash "$S2A_PRIVATE_TOOLS/sched.sh" pkg "$G" "$1" "$C"; }
 [ -z "$AO" ] && root_stage_done "$CUR" pkg "$PK" && { rm -f "$TL0"; echo "🟢 $G 现行已是包 $PK$(root_aoc_note "$CUR")"; [ $REG = 1 ] && { reg "$CUR/pkg" || exit 1; }; exit 0; }
 # -H：产物根的 romfs 是指向 RomFS 共享存储的相对软链（pack/roots.sh），临时目录里照抄会悬空；跟随它克隆成真目录（同原先）
 if [ -n "$AO" ]; then AOT=$(mktemp -d) || exit 1; trap 'plock_release "$PL_PID"; _root_rm_red "$AOT" "$G 只出程序（临时工作根）"' EXIT; W=$AOT/root; TAG=; mkdir -p "$W" && for e in $(ls -A "$CUR"); do [ "$e" = pkg ] || cp -cRH "$CUR/$e" "$W/" || exit 1; done || { echo "【红】$G 只出程序：克隆产物根 $CUR 失败"; exit 1; }   # 不克隆 pkg/（上一版资源包几万个文件，快道的资源包取自登记快照）
@@ -100,15 +97,19 @@ else TAG=$(root_tag "$G" "pkg-$C"); W=$(root_begin "$G" "$TAG") || exit 1; fi
 bash "$R/graphics/widen/scan/auto_pkg.sh" copy "$G" "$W" || { echo "【红】$G 宽屏表拷不进出包根"; exit 1; }   # 本次刚出的自动表直接进包（改写产物不依赖它，不重改写）
 # 失败时 build.log 随临时版本一起被 root_abort 清掉（10-23 用户体验线：Spare-host 上缺 platform/plat.h，只看到「1 error generated」，复跑 make 才找到原因）：
 #   清之前拷进 $S2A_ROOTS/.failed/<款>_ipa_build.log（同改写 / 着色器阶段的做法），报错行带上路径；只出程序的临时工作根不在这里删，由上面的 EXIT 陷阱删（所有出口）
-fail() { local L=$W/pkg/build.log K=; if [ -s "$L" ]; then mkdir -p "$S2A_ROOTS/.failed" && cp "$L" "$S2A_ROOTS/.failed/${G}_ipa_build.log" && K="；日志 $S2A_ROOTS/.failed/${G}_ipa_build.log"; fi
+#   同样带走 pkg/archive.log（「打 ipa」这一步的输出，ipa_tail.py 写）：打包失败时哪条超了上限 / 哪个 errno 才有地方看
+fail() { local L=$W/pkg/build.log A=$W/pkg/archive.log K=; if [ -s "$L" ]; then mkdir -p "$S2A_ROOTS/.failed" && cp "$L" "$S2A_ROOTS/.failed/${G}_ipa_build.log" && K="；日志 $S2A_ROOTS/.failed/${G}_ipa_build.log"; fi
+  if [ -s "$A" ]; then mkdir -p "$S2A_ROOTS/.failed" && cp "$A" "$S2A_ROOTS/.failed/${G}_ipa_archive.log" && K="${K}；日志 $S2A_ROOTS/.failed/${G}_ipa_archive.log"; fi
   echo "【红】$G 出包：$*$K"; [ -n "$AO" ] || root_abort "$G" "$TAG"; exit 1; }
 # 编译失败的头一条错误行（clang「error:」/「fatal error」、make「Error N」之前那条），找不到退回最后两行
 errline() { LC_ALL=C /usr/bin/grep -a -m1 -E 'error:|fatal error' "$1" 2> /dev/null | cut -c1-200 || true; }
 # 上一版的资源包与它的状态表（克隆过来的）留着：pack.py 按源字节数 / mtime 只重克隆、重算变了的文件，verify.py 按上次核对记录只重比变了的。
 #   10-21 查实：原先整个 pkg/ 先删，九款每版都把 3.5 万–13.8 万个文件（10–34 GB）全部重克隆、重算 SHA、再逐字节核对，资源包 + 核对 1–2 分钟
-t0=$SECONDS; for e in "$W/pkg"/*; do case "${e##*/}" in pack|pack.state.tsv|pack.verify.tsv) ;; *) _root_rm "$e";; esac; done; _root_rm "$W/build"; mkdir -p "$W/pkg"
+t0=$SECONDS; for e in "$W/pkg"/*; do case "${e##*/}" in pack|pack.files|pack.image.key|pack.files.state.tsv|pack.files.verify.tsv) ;; *) _root_rm "$e";; esac; done; _root_rm "$W/build"; mkdir -p "$W/pkg"
 TL=$W/pkg/timing.tsv; { printf '步\t墙钟秒\tuser秒\tsys秒\t退出码\n'; cat "$TL0"; } > "$TL"; rm -f "$TL0"   # 出包子步拆账（10-20 维护者：有缓存时出包 476 秒，要分清是哪一步）
-PN=5; PD=0   # 出包步数：组装（预编壳）、签名、打 ipa、资源包、资源包核对（本提交第一次出包另加一步出壳）
+# 出包步数：收尾各步由 pack/ipa_tail.py plan_steps 按签名方式 / 只出程序定（不在这里手写常数，原先写死 5 显示过「出包 6/5」）；本提交第一次出包另加一步出壳
+TAILN=$("${S2A_PY:-python3}" "$H/ipa_tail.py" --count-steps --work - --game - --shell - --bundle-id - --key - --title - --sign "$SIGN" ${AO:+--app-only}) || fail "算不出出包步数"
+PN=$TAILN; PD=0
 tmk() { TM "$@"; local r=$?; PD=$((PD + 1)); prog_tick 出包 "$PD" "$PN"; return $r; }   # 计时（tools/tm.py）+ 记一步进度
 # 包内能力清单 s2a_caps.tsv（组装时 pack/ship_ext.py 拷进包、宿主 caps.c 读）：改写阶段已在各平台共用的产物根里出好两份（pack/stage_rewrite.sh → pack/gen_caps.sh），这里不再另生成：
 #   缺省 = 发布包（默认开、强信号才关）；--all-caps = 测试包（有来源即开），用 s2a_caps.all.tsv 顶替
@@ -136,19 +137,19 @@ if [ -z "$SHELL_DIR" ]; then
   fi
   if [ ! -f "$SHELL_DIR/manifest.json" ] || [ -n "$STALE" ]; then mkdir -p "$SC" || fail "建不了壳缓存目录 $SC"
     [ "$(uname -s)" = Darwin ] || fail "本机没有壳 ${SID}，也没给发布源 S2A_SHELL_SOURCE（只有 Mac 能现出壳）"
-    ST=$SC/.tmp.$SID.$$; tmk "出壳（本提交第一次）" "$TL" -- bash "$H/shell_build.sh" "$ST" >> "$W/pkg/build.log" 2>&1 || { rm -rf "${ST:?}"; fail "出壳失败（$(grep -a '【红】' "$W/pkg/build.log" | tail -1)）"; }
-    if [ -n "$STALE" ] && ! mv "$SHELL_DIR" "$SC/.tmp.stale.$SID.$$" 2> /dev/null; then   # 旧编译器出的那份挪开（.tmp.* 由 tools/gc.sh 两小时后删）
+    ST=$SC/.tmp.$SID.$$; PN=$((TAILN + 1)); tmk "出壳（本提交第一次）" "$TL" -- bash "$H/shell_build.sh" "$ST" >> "$W/pkg/build.log" 2>&1 || { rm -rf "${ST:?}"; fail "出壳失败（$(grep -a '【红】' "$W/pkg/build.log" | tail -1)）"; }
+    if [ -n "$STALE" ] && ! mv "$SHELL_DIR" "$SC/.tmp.stale.$SID.$$" 2> /dev/null; then   # 旧编译器出的那份挪开（.tmp.* 两小时后可清：维护方内部清扫器定期删，手动清要确认无出包在跑）
       [ ! -e "$SHELL_DIR" ] || fail "旧编译器出的壳 $SHELL_DIR 挪不开（不挪开新壳会被套进它里面）"; fi   # 别的单已先挪走 = 不在了，照常
     if ! mv "$ST" "$SHELL_DIR" 2> /dev/null; then rm -rf "${ST:?}"; fi   # 两单同时出同一提交的壳：先到的发布，后到的丢自己那份（内容相同）
     s2a_tc_fp > "$SC/.$SID.toolchain" || fail "记不下壳的工具链版本（$SC/.$SID.toolchain）"
   fi
 fi
-touch "$SHELL_DIR" 2> /dev/null   # 目录时间 = 最近使用（tools/gc.sh 按它清壳缓存）
+touch "$SHELL_DIR" 2> /dev/null   # 目录时间 = 最近使用（维护方内部清扫器按它清壳缓存）
 [ -f "$SHELL_DIR/root/S2AShell.tables" ] && [ -f "$SHELL_DIR/manifest.json" ] || fail "壳目录 $SHELL_DIR 不完整（要 root/S2AShell.tables 与 manifest.json，pack/shell_build.sh 出）"
 # 出包收尾（组装 → 存档身份 → 图标 → Info.plist → 签名 → 提高内存上限权限核实 → 打 ipa → 进包核对 → 资源包 → 资源包核对）：唯一实现在 pack/ipa_tail.py，
 #   Windows 的 Python 编排调同一份（#1100，11-04）。包号 / 着色器目标 / 画面模式 / 资源包要件的判法都在那里
 . "$H/build_id.sh"; PKID=$(s2a_build_id "$PK")
-S2A_PKG_PROG_DONE=$PD S2A_PKG_PROG_TOTAL=$PN "${S2A_PY:-python3}" "$H/ipa_tail.py" --work "$W" --game "$G" --shell "$SHELL_DIR" --bundle-id "$BID" --suffix "$DSUF" \
+S2A_PKG_PROG_DONE=$PD "${S2A_PY:-python3}" "$H/ipa_tail.py" --work "$W" --game "$G" --shell "$SHELL_DIR" --bundle-id "$BID" --suffix "$DSUF" \
   --key "$PK" --title "$DT" --sign "$SIGN" --team "$TEAM" ${SIKEY:+--save-identity "$SI"} ${AO:+--app-only} > "$W/pkg/tail.out" 2>&1; trc=$?
 grep -av "^【红】" "$W/pkg/tail.out"; [ $trc = 0 ] || fail "$(grep -a "^【红】" "$W/pkg/tail.out" | tail -1 | sed "s/^【红】//")"
 if [ -n "$AO" ]; then mkdir -p "${S2A_APP_ONLY_OUT:?只出程序要 S2A_APP_ONLY_OUT}" && cp "$W/pkg/$G.ipa" "$W/pkg/timing.tsv" "$W/pkg/build.log" "$S2A_APP_ONLY_OUT/" || fail "拷出 ipa 失败"
@@ -164,9 +165,12 @@ if [ -d "$SA" ]; then mkdir -p "$W/pkg/save"; for d in device account; do [ -d "
 [ -d "$SA/padrec" ] && ls "$SA"/padrec/*.tsv > /dev/null 2>&1 && cp -cR "$SA/padrec" "$W/pkg/"   # 录 维护者 手柄（tools/padrec_pull.sh 拉回的 tsv + 存档画面）：正式局 MARK 后按它回放
 rm -rf "$W/build"; echo "$PK" > "$W/.stage_pkg"
 [ $ALLCAPS = 1 ] || [ $NATIVE = 1 ] && { mv -f "$W/.s2a_caps.release.tsv" "$W/s2a_caps.tsv" || fail "换回发布口径能力清单失败"; }
-ROOT_REPLAY="pkg .stage_pkg${SIKEY:+ save-identity.json}" root_commit "$G" "$TAG" || exit 1
+# 壳编号戳（启动器 pack/jobs/ipa.py 成功时写 <输出>/shell.id）：命令行一键出包也写一份进产物根，调用方转交 <输出>/shell.id。
+#   缺了它，启动器判「这款不是本壳出的」，装机 / 组装容器报 container_stale（11-08 玩家用命令行出完包，Mac 前端认不到、推不了）
+"$S2A_PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["details"]["shellId"], end="")' "$SHELL_DIR/manifest.json" > "$W/.shell_id" || fail "记不下壳编号（$SHELL_DIR/manifest.json）"
+ROOT_REPLAY="pkg .stage_pkg .shell_id${SIKEY:+ save-identity.json}" root_commit "$G" "$TAG" || exit 1
 P=$(root_cur "$G")/pkg
 echo "出包拆账（步 墙钟 / user / sys 秒）：$(tail -n +2 "$P/timing.tsv" | awk -F'\t' '{printf "%s %s/%s/%s；", $1, $2, $3, $4}')"
-echo "🟢 $G 出包 ${TAG}（$((SECONDS - t0)) 秒）：ipa $(du -h "$P/$G.ipa" | cut -f1)，资源包 $(tail -1 "$P/pack.log")$([ -s "$(root_cur "$G")/shaders/red.txt" ] && echo "；【红】着色器部分包：$(cat "$(root_cur "$G")/shaders/red.txt" 2>/dev/null)")$(root_aoc_note "$(root_cur "$G")")"
+echo "🟢 $G 出包 ${TAG}（$((SECONDS - t0)) 秒）：ipa $(du -h "$P/$G.ipa" | cut -f1)，资源包 $(tail -1 "$P/image.log")$([ -s "$(root_cur "$G")/shaders/red.txt" ] && echo "；【红】着色器部分包：$(cat "$(root_cur "$G")/shaders/red.txt" 2>/dev/null)")$(root_aoc_note "$(root_cur "$G")")"
 [ $REG = 1 ] && { reg "$P" || exit 1; }
 exit 0

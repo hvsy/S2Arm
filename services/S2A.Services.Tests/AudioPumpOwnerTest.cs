@@ -11,7 +11,7 @@ namespace S2A.Services.Tests
     //   预充下限 64 ms = 12288 B，垫 = min(下限, 槽长) = 9600 B；容差 5 ms = 240 帧。假设备的播放时钟同 AudioQueue（11-02 Mac 实测）：缓冲首尾相接排在时间线上，
     //   交还一块时播放时钟 = 这块末尾 − 700 帧（Mac 实测 620–750）。期望全部按语义手算：
     // ① 单缓冲客人（等这块播完才交下一块，交还后立刻交）：起播 1 块，之后 12 轮「设备交还 → 再交 1 块」，设备上应只有 13 块 4096 B 真实样本、静音 0 块
-    // ② 提前供数的流（正对照，马车8 那种）：连交 10 块 → 全部交还 → 生产方卡 120 ms（播放时钟走 5760 帧）→ 再交 1 块：先 9600 B 静音再 4096 B
+    // ② 提前供数的流（正对照，0100152000022000 那种）：连交 10 块 → 全部交还 → 生产方卡 120 ms（播放时钟走 5760 帧）→ 再交 1 块：先 9600 B 静音再 4096 B
     // ③ 停设备期间只留一个交缓冲的：5 块在途时 Restart，停的过程中游戏线程交 2 块并 Pump、设备按 AudioQueueStop 文档逐块回调交还（回调里照常 Pump）；
     //    停时交的缓冲留在设备里（停之后才入队）。期望：同一块缓冲在设备里时被再交 0 次；停完收回 0 B（缓冲都经回调交还了）；
     //    停完时间线从头算、交还相位要重新学，不补垫：真实 2 块、静音 0 块（样本 6、7、8 共 12288 B 按槽长切成 9600 + 2688）
@@ -190,6 +190,48 @@ namespace S2A.Services.Tests
                 bool ok = expect == actual;
                 if (!ok) bad++;
                 Console.WriteLine($"{(ok ? "✓" : "✗")} 音频泵 {name}：{expect} → {actual}");
+            }
+
+            return bad == 0 ? 0 : 1;
+        }
+
+        // S2Arm (11-09): Apple renderer output (audren) starts on its first 5 ms block instead of the audout 64 ms pre-roll.
+        // The session lowers the pump floor before the first submit; the audout path keeps the construction floor.
+        [SoloTest("--audio-renderer-preroll")]
+        private static int RunRendererPreRoll()
+        {
+            var rows = new List<(string Name, string Expect, string Actual)>();
+
+            {
+                var p = new DevicePump();
+                p.Queue(1);
+                p.Pump();
+                rows.Add(("① audout 未改预充：首块 4096 B 后 primed", "False", p.PrimedForStart.ToString()));
+            }
+
+            {
+                var p = new DevicePump();
+                p.SetPrimeFloor(0);
+                p.Queue(1);
+                p.Pump();
+                rows.Add(("② 渲染器在首块前把预充下限改 0：primed / 设备里的块数", "True / 1", $"{p.PrimedForStart} / {p.Device.Count}"));
+            }
+
+            {
+                var p = new DevicePump();
+                p.Queue(1);
+                p.Pump();
+                p.SetPrimeFloor(0);
+                for (int k = 2; k <= 3; k++) { p.Queue(k); p.Pump(); }
+                rows.Add(("③ 起播前已按 64 ms 门槛走过 Pump 但未达下限：改 0 仍生效（第二块起 primed）", "True", p.PrimedForStart.ToString()));
+            }
+
+            int bad = 0;
+            foreach (var (name, expect, actual) in rows)
+            {
+                bool ok = expect == actual;
+                if (!ok) bad++;
+                Console.WriteLine($"{(ok ? "✓" : "✗")} 渲染器预充 {name}：{expect} → {actual}");
             }
 
             return bad == 0 ? 0 : 1;

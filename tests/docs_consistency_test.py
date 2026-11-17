@@ -97,13 +97,15 @@ class PolicyTests(unittest.TestCase):
 
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
+        # 假仓库自带 tools/train.sh：清掉 S2A_PRIVATE_TOOLS，否则被测工具优先读维护方真实列车脚本、与夹具对不上（11-09 门禁环境下 2 例红）
+        saved = os.environ.pop('S2A_PRIVATE_TOOLS', None)
+        if saved is not None: self.addCleanup(os.environ.__setitem__, 'S2A_PRIVATE_TOOLS', saved)
         self.tmp = tempfile.TemporaryDirectory(prefix='s2arm-docs-')
         self.addCleanup(self.tmp.cleanup)
         self.repo = Path(self.tmp.name)
         for name, value in {'tools/train.sh': TRAIN, 'tools/contrib_check.sh': CONTRIB,
                             'docs/坑记录.md': '# 记录\n## 唯一\n原创正文\n',
-                            'CONTRIBUTING.md': '# 贡献\n' + BLOCK + '\n',
-                            'docs/协作循环.md': '# 协作\n' + BLOCK + '\n'}.items():
+                            'CONTRIBUTING.md': '# 贡献\n' + BLOCK + '\n'}.items():
             self.write(name, value)
 
     def write(self, name, value):

@@ -18,26 +18,31 @@ namespace S2A.Gfx
     {
         public static int ParseLimit(string configuredValue)
         {
-            return configuredValue switch
-            {
-                null or "0" => 0,
-                "30" => 30,
-                "60" => 60,
-                "120" => 120,
-                _ => throw new ArgumentOutOfRangeException(nameof(configuredValue), configuredValue, "S2A_FPS must be exactly 0, 30, 60, or 120."),
-            };
+            // 与直连 graphics/nvn/gfx/nvn/nvn_fps.c nvn_fps_parse 同口径：未设 / "0" = 不限；24–1000 的十进制整数（不带符号、空格或尾随字符）
+            if (configuredValue is null or "0") return 0;
+            int value = 0;
+            bool ok = configuredValue.Length is > 0 and <= 4;
+            foreach (char c in configuredValue) { if (c is < '0' or > '9') { ok = false; break; } value = value * 10 + (c - '0'); }
+            if (!ok || value < MinLimit || value > MaxLimit)
+                throw new ArgumentOutOfRangeException(nameof(configuredValue), configuredValue, $"S2A_FPS must be 0 or an integer {MinLimit}-{MaxLimit}.");
+            return value;
         }
+
+        public const int MinLimit = 24, MaxLimit = 1000;
+        static bool Valid(int fps) => fps == 0 || fps is >= MinLimit and <= MaxLimit;
 
         public static int SwapIntervalFloor(int fps, long targetVsyncInterval)
         {
-            if (fps is not (0 or 30 or 60 or 120)) throw new ArgumentOutOfRangeException(nameof(fps));
+            if (!Valid(fps)) throw new ArgumentOutOfRangeException(nameof(fps));
             if (fps == 0) return 0;
-            return Math.Max(1, (int)Math.Round((double)targetVsyncInterval / fps));
+            // 生产端下限取「不慢于上限」的最大交换间隔：floor(vsync / 上限)，至少 1。30 / 60 / 120 与原来的四舍五入同值（2 / 1 / 1）；
+            //   非整除的档（如 40：floor 1.5 = 1）不能四舍五入成 2，那会把生产端压到 30 帧、比上限还慢
+            return Math.Max(1, (int)Math.Floor((double)targetVsyncInterval / fps));
         }
 
         public static float MinimumPresentationInterval(float gameIntervalSeconds, int fps)
         {
-            if (fps is not (0 or 30 or 60 or 120)) throw new ArgumentOutOfRangeException(nameof(fps));
+            if (!Valid(fps)) throw new ArgumentOutOfRangeException(nameof(fps));
             return fps == 0 ? gameIntervalSeconds : Math.Max(gameIntervalSeconds, 1f / fps);
         }
     }
@@ -269,7 +274,7 @@ namespace S2A.Gfx
             //   （同存档同路线只关 NXGAL_PSO_ASYNC 即恢复正常，docs/坑记录.md）。两个开关仍可在外部设 1 做对照
             if (Threaded && r is not Ryujinx.Graphics.GAL.Multithreading.ThreadedRenderer) Console.Error.WriteLine("[gal] 【红】双线程渲染开着，但渲染器没套 ThreadedRenderer（Compose.cs）");
             r.Initialize(GraphicsDebugLevel.None);
-            if (OperatingSystem.IsIOS() && !NxIosLayer.TryAttach(r))
+            if ((OperatingSystem.IsIOS() || OperatingSystem.IsTvOS()) && !NxIosLayer.TryAttach(r))
             {
                 // RunLoop has not started GPU emulation. Let Stop observe both
                 // threads as finished; the shell keeps the error page/diagnostics.

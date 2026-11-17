@@ -24,6 +24,7 @@ cp "$H/pack/roots.sh" "$H/pack/stage_direct.sh" "$H/pack/stage_direct_seed.sh" "
    "$H/pack/ipa_key.sh" "$H/pack/pkg_srcs.py" "$H/pack/pkg_inputs_key.py" $T/repo/pack/
 cp "$H/tools/toolchain.sh" "$H/tools/toolchain.env" "$H/tools/machine.sh" "$H/tools/clonedir.py" "$H/tools/plock.sh" "$H/tools/flock_hold.py" "$H/tools/stage_deps.py" $T/repo/tools/; cp -R "$H/tools/stage_deps_hook" $T/repo/tools/
 cp "$H/graphics/nvn/tools/romfs_list.py" "$H/graphics/nvn/tools/gfx_api.py" $T/repo/graphics/nvn/tools/; cp "$H/graphics/tools/shbake/pak_crypto.py" $T/repo/graphics/tools/shbake/
+mkdir -p "$T/repo/tools"; cp "$H/tools/pool_workers.py" "$T/repo/tools/"   # romfs_list / pak_crypto 经它取核数（#1332：核数唯一来源）
 for f in run_knowledge.py fout_want.py se_want.py run_pairs.py pso_layout.py pso_layout.json pso_seed.py; do cp "$H/graphics/tools/direct/$f" $T/repo/graphics/tools/direct/; done
 echo m > $T/repo/graphics/metal/gal_prog.m; printf 'def version(): return "v1"\n' > $T/repo/translator/dmsh_chain.py
 printf '入\t%s\n' pack/stage_direct.sh pack/ue_pak.py graphics/metal/gal_prog.m graphics/tools/direct/run_knowledge.py > $T/repo/pack/stage_inputs/direct.tsv
@@ -45,7 +46,8 @@ printf '{"title": "0100AAAA00000000", "pso_seed": "gen"}\n' > "$O/direct_lib.jso
 echo "[直连库] 🟢 0100AAAA00000000 直连库 b-v1：并集 4，出库 4，没出成 0"
 EOF
 (cd $T/repo && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm x)
-export S2A_ROOTS=$T/roots S2A_ROOTS_SHARED=$T/shared FAKE_CALLS=$T/calls S2A_RUN_ROOT=$T/run HOME=$T/home; unset S2A_PSO_SOURCES
+# 假仓库不读本机配置（11-09：门禁 / 维护方机器设了 S2A_MACHINE_LOCAL，machine.local 里 S2A_PY=$HOME/…/venv 在 HOME 换成临时目录后指向不存在的 Python，12 例全红）
+export S2A_ROOTS=$T/roots S2A_ROOTS_SHARED=$T/shared FAKE_CALLS=$T/calls S2A_RUN_ROOT=$T/run HOME=$T/home; unset S2A_PSO_SOURCES S2A_MACHINE_LOCAL S2A_PY
 mkdir -p $T/roots/acnh@s0/romfs $T/roots/acnh@s0/exefs $T/home; echo r > $T/roots/acnh@s0/romfs/f; echo main > $T/roots/acnh@s0/exefs/main; echo ksh > $T/roots/acnh@s0/.stage_shaders
 printf 'title_id\t0100aaaa00000000\n' > $T/roots/acnh@s0/unpack.tsv; ln -s acnh@s0 $T/roots/acnh@现行
 SD=$T/run/s2arm/pso_seed/0100AAAA00000000; mkdir -p $SD

@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "ios"))
@@ -125,7 +126,7 @@ class ShipExtTest(unittest.TestCase):
         (r / "S2Arm").write_bytes(b"\xcf\xfa\xed\xfe" + bytes(60))
         (r / "Frameworks").mkdir()
         (r / "S2AShell.tables").write_text("addr_need.tsv\nwiden_enable.*.tsv\n")
-        ident = shell_manifest._defaults() if commit_ok else ("0" * 40, "f" * 16, "x", "1.0")
+        ident = shell_manifest._defaults() if commit_ok else ("0" * 40, "f" * 16, "x", "1.0", "27")
         shell_manifest.seal(r, Path(d) / "shell/manifest.json", *ident)
         return Path(d) / "shell"
 
@@ -239,21 +240,51 @@ class ContainerTest(unittest.TestCase):
         (root / "ctl").mkdir(); (root / "ctl/control.nacp").write_bytes(bytes(nacp))
         return root
 
-    def run_c(self, d, shell, out, roots, base=None):
+    def run_c(self, d, shell, out, roots, base=None, version=None, display_version=None):
         from PIL import Image
         icon = Path(d) / "brand.png"
         if not icon.exists(): Image.new("RGB", (64, 64), (1, 2, 3)).save(icon)
-        cmd = [sys.executable, str(REPO / "pack/ship_ext.py"), "container", "--shell", str(shell), "--out", str(out), "--bundle-id", "dev.example.games", "--icon", str(icon)]
-        cmd += [x for r in roots for x in ("--game", str(r))] + (["--base", str(base)] if base else [])
-        return subprocess.run(cmd, capture_output=True, text=True)
+        cmd = [sys.executable, str(REPO / "pack/ship_ext.py"), "container", "--shell", str(shell), "--out", str(out), "--bundle-id", "dev.example.games", "--icon", str(icon), "--host-abi", "7"]
+        cmd += [x for r in roots for x in ("--game", str(r))] + (["--base", str(base)] if base else []) + (["--version", version] if version else [])
+        cmd += ["--display-version", display_version] if display_version else []
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              env={**os.environ, "S2A_BANNER_FETCH": "0"})   # 单测零联网：抓图关掉，A 的 banner 走产物根自带拷贝路径
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory(); self.d = Path(self.td.name)
         self.shell = ShipExtTest.shell(None, self.d)
         self.a = self.game(self.d, "a", 3, 0, 0x0100000000010000, "甲游戏")
+        (self.a / "banner.jpg").write_bytes(b"JPGbanner-a")   # A 的产物根自带横版图：组装走拷贝路径，目录期望里的 banner 与联网无关
         self.b = self.game(self.d, "b", 3, 0x1000, 0x0100000000020000, "乙游戏", b"")
 
     def tearDown(self): self.td.cleanup()
+
+    def test_version_written_into_info_plist(self):
+        # 三端同号：电脑上 S2Arm 的发版号写进容器 Info.plist 的 CFBundleShortVersionString；不给 --version 就沿用壳里的
+        import plistlib
+        # 界面版本字同理写 S2ADisplayVersion（设置页 / 游戏库顶部读）；不给就不写
+        r = self.run_c(self.d, self.shell, self.d / "v1/S2Arm.app", [self.a], version="9.8.7", display_version="v9.8.7-dev+abc1234")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        p1 = plistlib.loads((self.d / "v1/S2Arm.app/Info.plist").read_bytes())
+        self.assertEqual((p1["CFBundleShortVersionString"], p1["S2ADisplayVersion"]), ("9.8.7", "v9.8.7-dev+abc1234"))
+        r = self.run_c(self.d, self.shell, self.d / "v2/S2Arm.app", [self.a])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        shell_v = plistlib.loads((self.shell / "root/Info.plist").read_bytes()).get("CFBundleShortVersionString")
+        p2 = plistlib.loads((self.d / "v2/S2Arm.app/Info.plist").read_bytes())
+        self.assertEqual(p2.get("CFBundleShortVersionString"), shell_v)
+        self.assertNotIn("S2ADisplayVersion", p2)
+
+    def test_ctx_text_tvos_paths(self):
+        # Apple TV 容器（组装时 S2A_APPLE_OS=tvos）：文档根 Library/Caches/S2Arm/games/<号>、资源包 <文档根>/资源包（同 runtime/include/s2a_docs.h 电视口径）
+        import unittest.mock as um
+        sys.path.insert(0, str(REPO / "pack")); import ship_ext
+        g = "0100000000010000"
+        with um.patch.dict(os.environ, {"S2A_APPLE_OS": "tvos"}):
+            tv = ship_ext.ctx_text(g)
+        self.assertEqual(tv, f"version\t1\ngame_id\t{g}\nimages\t@bundle/Frameworks/S2AImages-{g}.dylib\nmodule_dir\t@bundle/Games/{g}\n"
+                             f"game_data\t@home/Library/Caches/S2Arm/games/{g}/资源包\ndocs\t@home/Library/Caches/S2Arm/games/{g}\n")
+        with um.patch.dict(os.environ, {"S2A_APPLE_OS": "ios"}):
+            self.assertIn(f"docs\t@home/Documents/games/{g}\n", ship_ext.ctx_text(g))   # iPhone 照旧
 
     def test_layout_catalogue_and_window_max(self):
         r = self.run_c(self.d, self.shell, self.d / "o1/S2Arm.app", [self.a, self.b])
@@ -269,12 +300,13 @@ class ContainerTest(unittest.TestCase):
         self.assertEqual((app / "Games" / self.A / "addr_need.tsv").read_text(), "a\n")
         self.assertEqual((app / "Games" / self.B / "icon.jpg").read_bytes(), b"JPGb")
         cat = json.loads((app / "s2a_catalogue.json").read_text(encoding="utf-8"))
+        chain = json.loads((self.shell / "manifest.json").read_text(encoding="utf-8"))["details"]["chain"]   # 每款记 --host-abi 与壳清单的链号（只换宿主判兼容用）
         self.assertEqual(cat, {"schema": 1, "shell_id": shell_manifest.current_id(), "games": [
-            {"title_id": self.A, "name": "甲游戏", "display_version": "1.2.0", "icon": f"Games/{self.A}/icon.jpg", "state": "playable"},
-            {"title_id": self.B, "name": "乙游戏", "icon": f"Games/{self.B}/icon.jpg", "state": "playable"}]})
+            {"title_id": self.A, "name": "甲游戏", "display_version": "1.2.0", "icon": f"Games/{self.A}/icon.jpg", "banner": f"Games/{self.A}/banner.jpg", "state": "playable", "host_abi": 7, "chain": chain},
+            {"title_id": self.B, "name": "乙游戏", "icon": f"Games/{self.B}/icon.jpg", "state": "playable", "host_abi": 7, "chain": chain}]})
         self.assertEqual((app / "Games" / self.A / "launch.ctx").read_text(encoding="utf-8"),
                          f"version\t1\ngame_id\t{self.A}\nimages\t@bundle/Frameworks/S2AImages-{self.A}.dylib\nmodule_dir\t@bundle/Games/{self.A}\n"
-                         f"game_data\t@home/Documents/games/{self.A}/资源包\ndocs\t@home/Documents/games/{self.A}\n")
+                         f"game_data\t@home/Library/Application Support/S2Arm/games/{self.A}/资源包\ndocs\t@home/Documents/games/{self.A}\n")   # 资源包挪出 Documents（11-11）
         info = plistlib.loads((app / "Info.plist").read_bytes())
         self.assertEqual((info["CFBundleIdentifier"], info["CFBundleDisplayName"]), ("dev.example.games", "S2Arm"))
 
@@ -314,6 +346,123 @@ class ContainerTest(unittest.TestCase):
         (base / "s2a_catalogue.json").write_text(json.dumps(cat))
         r = self.run_c(self.d, self.shell, self.d / "o7/S2Arm.app", [a2], base=base)
         self.assertEqual(r.returncode, 1); self.assertIn("要按本壳重出", r.stderr); self.assertIn(self.B, r.stderr)   # 已有款 B 是别的壳组装的：不混装
+
+
+class ProgramPackTest(unittest.TestCase):
+    """程序包（通用壳，ship_ext.py program）：一款程序出成 <out>/{S2AImages-<游戏号>.dylib, Games/<游戏号>/}，不签名、不写清单。
+       期望不靠被测代码算：同一份产物根用现有的 container 组一次，程序包里的 dylib 与容器里 Frameworks/S2AImages-<游戏号>.dylib 逐字节相同、
+       随行目录逐文件相同（同一个 place_game，只差容器自己的 launch.ctx）；目标已在报红；失败不留半个目录"""
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(); self.d = Path(self.td.name)
+        self.shell = ShipExtTest.shell(None, self.d)
+        self.root = ContainerTest.game(None, self.d, "a", 3, 0, 0x0100000000010000, "甲游戏")
+
+    def tearDown(self): self.td.cleanup()
+
+    def run_p(self, root, out):
+        return subprocess.run([sys.executable, str(REPO / "pack/ship_ext.py"), "program", "--shell", str(self.shell), "--root", str(root), "--out", str(out)],
+                              capture_output=True, text=True)
+
+    def test_program_matches_container_bytes(self):
+        out = self.d / "p/program"
+        r = self.run_p(self.root, out); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        gid = ContainerTest.A
+        self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1]), {"gid": gid, "image": f"S2AImages-{gid}.dylib", "ast": 3, "name": "甲游戏", "display_version": "1.2.0"})
+        self.assertEqual(sorted(p.name for p in out.iterdir()), ["Games", f"S2AImages-{gid}.dylib"])
+        app = self.d / "c/S2Arm.app"
+        c = ContainerTest.run_c(None, self.d, self.shell, app, [self.root]); self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+        self.assertEqual((out / f"S2AImages-{gid}.dylib").read_bytes(), (app / f"Frameworks/S2AImages-{gid}.dylib").read_bytes())
+        mine = {p.relative_to(out / "Games" / gid): p.read_bytes() for p in (out / "Games" / gid).rglob("*") if p.is_file()}
+        theirs = {p.relative_to(app / "Games" / gid): p.read_bytes() for p in (app / "Games" / gid).rglob("*") if p.is_file() and p.name != "launch.ctx"}
+        self.assertEqual(mine, theirs)   # 只差容器自己的启动上下文 launch.ctx（自动化起局用，程序包不带）
+        self.assertIn(Path("main.npdm"), mine); self.assertIn(Path("main.fixups.tsv"), mine); self.assertIn(Path("addr_need.tsv"), mine); self.assertIn(Path("icon.jpg"), mine)
+
+    def test_program_carries_save_identity_like_container(self):
+        # 11-17 与 iOS 加载侧定：程序包款宿主按模块目录（program/Games/<号>/）读存档身份（ios/save_transfer.m），所以随程序包走；
+        #   期望 = 同一份产物根组出的容器里 Games/<号>/save-identity.json（逐字节）；身份不合法 → 报红、不留目录
+        gid = ContainerTest.A
+        (self.root / "save-identity.json").write_text(json.dumps(dict(id=gid, name="甲游戏", version=65536, contentIdentity="ab" * 32)))
+        out = self.d / "p/program"
+        r = self.run_p(self.root, out); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        app = self.d / "c/S2Arm.app"
+        c = ContainerTest.run_c(None, self.d, self.shell, app, [self.root]); self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+        self.assertEqual((out / "Games" / gid / "save-identity.json").read_bytes(), (app / "Games" / gid / "save-identity.json").read_bytes())
+        (self.root / "save-identity.json").write_text(json.dumps(dict(id=gid, name="甲游戏")))
+        out2 = self.d / "q/program"
+        r = self.run_p(self.root, out2); self.assertNotEqual(r.returncode, 0); self.assertIn("存档游戏身份校验失败", r.stdout + r.stderr)
+        self.assertFalse(out2.exists())
+
+    def test_program_refuses_existing_and_leaves_nothing_on_failure(self):
+        out = self.d / "p/program"; out.mkdir(parents=True)
+        r = self.run_p(self.root, out); self.assertNotEqual(r.returncode, 0); self.assertIn("不覆盖已有目标", r.stdout + r.stderr)
+        (self.root / "main.npdm").unlink(); out2 = self.d / "q/program"
+        r = self.run_p(self.root, out2); self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(out2.exists()); self.assertFalse(any((self.d / "q").glob(".program-*")) if (self.d / "q").exists() else False)
+
+
+class ShellOnlyTest(unittest.TestCase):
+    """只有壳的容器（通用壳 0.6.0，container --shell-only）：期望手写——清单 games 为空、壳号 = 同一壳组的普通容器的壳号；
+       App 里没有 Games/ 下任何一款、没有 Frameworks/S2AImages-*；除此之外的文件与同一壳组的普通容器同名同在；带 --game 报红"""
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(); self.d = Path(self.td.name)
+        self.shell = ShipExtTest.shell(None, self.d)
+        self.a = ContainerTest.game(None, self.d, "a", 3, 0, 0x0100000000010000, "甲游戏")
+
+    def tearDown(self): self.td.cleanup()
+
+    def run_s(self, out, extra=()):
+        from PIL import Image
+        icon = self.d / "brand.png"
+        if not icon.exists(): Image.new("RGB", (64, 64), (1, 2, 3)).save(icon)
+        return subprocess.run([sys.executable, str(REPO / "pack/ship_ext.py"), "container", "--shell-only", "--shell", str(self.shell), "--out", str(out),
+                               "--bundle-id", "dev.example.games", "--icon", str(icon), "--host-abi", "7", *extra], capture_output=True, text=True)
+
+    def test_shell_only(self):
+        app = self.d / "s/S2Arm.app"
+        r = self.run_s(app); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ref = self.d / "c/S2Arm.app"
+        c = ContainerTest.run_c(None, self.d, self.shell, ref, [self.a]); self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+        cat, rc = (json.loads((x / "s2a_catalogue.json").read_text(encoding="utf-8")) for x in (app, ref))
+        self.assertEqual(cat, dict(schema=1, shell_id=rc["shell_id"], games=[]))
+        self.assertFalse(list(app.glob("Frameworks/S2AImages-*"))); self.assertFalse((app / "Games").exists() and any((app / "Games").iterdir()))
+        mine = {p.relative_to(app).as_posix() for p in app.rglob("*") if p.is_file()}
+        theirs = {p.relative_to(ref).as_posix() for p in ref.rglob("*") if p.is_file() and not p.relative_to(ref).as_posix().startswith(("Games/", "Frameworks/S2AImages-"))}
+        self.assertEqual(mine, theirs)
+
+    def test_shell_only_refuses_games(self):
+        r = self.run_s(self.d / "x/S2Arm.app", ["--game", str(self.a)])
+        self.assertNotEqual(r.returncode, 0); self.assertIn("--shell-only 只装壳", r.stdout + r.stderr)
+
+
+class BannerPlaceTest(unittest.TestCase):
+    """_place_banner 的联网分支打桩测（进程内直调 ship_ext，mock 掉 banner_fetch.fetch_banner，零真联网；#101 评审 1 项）。
+    子进程组装测（ContainerTest）已用 S2A_BANNER_FETCH=0 + 产物根自带图保证离线确定性，这里补抓图分支本身。"""
+    GID = "0100000000010000"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(); self.d = Path(self.td.name)
+        self.gd = self.d / "Games" / self.GID; self.gd.mkdir(parents=True)
+        self.root = self.d / "root"; self.root.mkdir()   # 无 banner.jpg 的产物根 → 逼出联网分支
+
+    def tearDown(self): self.td.cleanup()
+
+    def test_library_banner_copied_never_network(self):
+        # 横图是游戏库的元数据（作业层导入时抓好）：给了 --banner 那份就拷；组装本身绝不联网
+        from pack import ship_ext
+        lib = self.d / "lib-banner.jpg"; lib.write_bytes(b"LIB")
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("组装不许联网")):
+            entry = {}
+            ship_ext._place_banner(self.GID, self.root, self.gd, entry, lib)
+        self.assertEqual(entry.get("banner"), f"Games/{self.GID}/banner.jpg")
+        self.assertEqual((self.gd / "banner.jpg").read_bytes(), b"LIB")
+
+    def test_no_banner_anywhere_keeps_icon_only(self):
+        from pack import ship_ext
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("组装不许联网")):
+            entry = {}
+            ship_ext._place_banner(self.GID, self.root, self.gd, entry)
+        self.assertNotIn("banner", entry)
+        self.assertFalse((self.gd / "banner.jpg").exists())
 
 
 if __name__ == "__main__":

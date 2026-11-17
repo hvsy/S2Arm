@@ -5,6 +5,9 @@
 #include "../include/s2a_hud.h"
 #include "../include/s2a_gfx_mode.h"
 #include <math.h>
+#include <stdatomic.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
 _Atomic uint64_t g_s2a_hud_ft[2048], g_s2a_hud_fn;   // 上屏时间戳环（生产在 ap_host.c）：空环 = 慢帧「未测」，不影响目标
 static int g_mode = S2A_GFX_DIRECT, g_gl = -1, g_nv = 60;
 int s2a_gfx_mode(void) { return g_mode; }
@@ -12,9 +15,38 @@ const char *s2a_gfx_mode_brief(void) { return "单测"; }
 int s2a_widen_full(void) { return 0; }
 int s2a_widen_game(void) { return 0; }
 int s2a_energy_snap(s2a_esnap *s) { (void)s; return 1; }
+static uint64_t g_gpu_alloc;   // 浮层「GPU 已分配」（生产在 nvn_mtl.m）：0 = 没有直连层
+uint64_t s2a_gpu_alloc_bytes(void) { return g_gpu_alloc; }
+double s2a_gpu_busy_rate(const s2a_esnap *a, const s2a_esnap *b) { (void)a; (void)b; return -1; }   // 桩：上面采样恒失败，走不到这里
 int nvn_gl_game_fps(void) { return g_gl; }   // 浮层按名字取（dlsym），这里给强定义当 GL 前端
 int nvn_game_fps(void) { return g_nv; }
+// 固定内存采样结果，验证成功和失败都不会因 Metal HUD 请求被隐藏。
+static int g_mem_ok = 1;
+kern_return_t task_info(task_name_t task, task_flavor_t flavor, task_info_t info, mach_msg_type_number_t *count) {
+    (void)task; (void)flavor; (void)count;
+    if (!g_mem_ok) return KERN_FAILURE;
+    ((task_vm_info_t)info)->phys_footprint = 123 * 1048576ULL;
+    return KERN_SUCCESS;
+}
 static int fails;
+static void check_display(const char *label, const s2a_hud_host *host, int frames, int mem_ok) {
+    char text[4096];
+    g_mem_ok = mem_ok;
+    atomic_store(&g_s2a_hud_fn, 0);
+    if (frames) {
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        atomic_store(&g_s2a_hud_ft[0], mach_absolute_time() * tb.numer / tb.denom);
+        atomic_store(&g_s2a_hud_fn, 1);
+    }
+    s2a_hud_text(text, sizeof text, host);
+    const char *fps = frames ? "帧率 1 / 目标 " : "帧率 0 / 目标 ";
+    const char *mem = mem_ok ? "内存 123 MB / 上限 " : "内存 读取失败 / 上限 ";
+    int ok = strstr(text, fps) && strstr(text, mem) && strstr(text, "慢帧 未测（近 10 秒不到两帧）");
+    if (host && host->metal_hud_requested) ok = ok && strstr(text, "Metal HUD 已请求");
+    else ok = ok && !strstr(text, "Metal HUD 已请求");
+    printf("%s：期望 FPS、内存与慢帧口径显示 → %s\n", label, ok ? "显示" : "缺失");
+    if (!ok) { printf("✗ t_hud：%s，输出：%s\n", label, text); fails++; }
+}
 static int target(void) {
     char t[4096]; s2a_hud_host h = {.thermal = "单测", .build_id = "t_hud", .battery_rate_pm = NAN, .battery_level = -1};
     s2a_hud_text(t, sizeof t, &h);
@@ -41,6 +73,32 @@ int main(void) {
         g_mode = c[i].mode; g_gl = c[i].gl; g_nv = c[i].nv;
         if (c[i].cap) setenv("S2A_FPS", c[i].cap, 1); else unsetenv("S2A_FPS");
         int got = target(); printf("%s 期望 %d → 真结果 %d\n", c[i].what, c[i].want, got); if (got != c[i].want) fails++;
+    }
+    s2a_hud_host h = {.thermal = "单测", .build_id = "t_hud", .battery_rate_pm = NAN, .battery_level = -1};
+    check_display("官方 HUD 未请求，1 帧 / 内存可读", &h, 1, 1);
+    h.metal_hud_requested = 1;
+    check_display("官方 HUD 已请求，1 帧 / 内存可读", &h, 1, 1);
+    check_display("官方 HUD 已请求，空帧环 / 内存读取失败", &h, 0, 0);
+    check_display("宿主信息缺失，空帧环 / 内存读取失败", NULL, 0, 0);
+    // 两本账（11-13）：期望手写——桩的实占 123 MB = 0.12 GB → 「0.1」；GPU 已分配 5.5 GiB = 5905580032 字节 → 简版「5.5 GB」、开发浮层「5632 MB」；
+    //   没有直连层（0）时简版只写实占「0.1 GB」、不出 GPU
+    {
+        char b[256], t[4096]; g_mem_ok = 1; s2a_hud_host hh = {.thermal = "单测", .build_id = "t_hud", .battery_rate_pm = NAN, .battery_level = -1};
+        g_gpu_alloc = 5905580032ull; s2a_hud_brief(b, sizeof b); s2a_hud_text(t, sizeof t, &hh);
+        int ok1 = strstr(b, "进程 0.1 GB · GPU 5.5 GB") != NULL, ok2 = strstr(t, "GPU 已分配 5632 MB") != NULL;
+        printf("GPU 已分配 5.5 GiB：简版期望含「进程 0.1 GB · GPU 5.5 GB」→ %s；开发浮层期望含「GPU 已分配 5632 MB」→ %s\n", b, ok2 ? "含" : "不含");
+        if (!ok1 || !ok2) fails++;
+        g_gpu_alloc = 0; s2a_hud_brief(b, sizeof b);
+        int ok3 = strstr(b, "· 0.1 GB") && !strstr(b, "GPU");
+        printf("没有直连层：简版期望只写「0.1 GB」→ %s\n", b); if (!ok3) fails++;
+    }
+    {   // 补帧（11-14）：补出的帧真上了屏就算进屏上帧率。期望手写：1 秒内补出 24 帧、游戏帧环里 1 帧 → 「屏上 25 帧（游戏 1）」；没补帧时不出「屏上」（上一段已核）
+        void s2a_hud_mid_frame(void); char b[256];
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        atomic_store(&g_s2a_hud_ft[0], mach_absolute_time() * tb.numer / tb.denom); atomic_store(&g_s2a_hud_fn, 1);
+        for (int i = 0; i < 24; i++) s2a_hud_mid_frame();
+        s2a_hud_brief(b, sizeof b); int ok = strstr(b, "屏上 25 帧（游戏 1）") != NULL;
+        printf("补帧：补出 24 帧 + 游戏 1 帧，简版期望含「屏上 25 帧（游戏 1）」→ %s\n", b); if (!ok) fails++;
     }
     if (fails) printf("✗ t_hud：%d 项不符\n", fails); else printf("✓ t_hud：浮层目标 = min(游戏帧率, 上限)，GL 不锁时 = 上限，非法上限不进浮层，全过\n");
     return fails != 0;

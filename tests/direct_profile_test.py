@@ -15,6 +15,7 @@ import unittest
 import unittest.mock
 
 REPO = Path(__file__).resolve().parents[1]
+os.environ["S2A_DISK_FREE_G"] = "999"   # 盘判定不看本机实况：出库开工前的空间复核（pack/jobs/space_rule.py）与刷新磁盘闸都按注入余量判（11-09 门禁机余量紧时假红）
 sys.path.insert(0, str(REPO / "graphics/nvn/tools"))
 import direct_profile as dp
 
@@ -308,6 +309,15 @@ class Profiles(unittest.TestCase):
             path = dp.NX / "games" / name if name in ("game.py", "profile_guess.py") else dp.HERE / name
             self.assertEqual(value, dp.file_digest(path))
 
+    def test_unreal4_marker_needs_word_start(self):
+        # 11-16 出包提速：「Unreal 4」特征从带后顾断言的正则换成字节查找 + 看前一个字节（逐字等价 (?<![A-Za-z])UE4）。期望手写：
+        #   VALUE4（暗黑3 main 里的误报源）不算；UE4Game / 开头的 UE4 / 前面是 _ 或 . 的算；只出现在字母后面的不算，后面又有一处独立的就算
+        sys.path.insert(0, str(REPO / "graphics/nvn/games")); sys.path.insert(0, str(REPO / "graphics/nvn/tools"))
+        import profile_guess as g
+        pat = next(p for p, name in g.MARKERS if name == "Unreal 4")
+        cases = [(b"xx VALUE4 yy", False), (b"UE4Game", True), (b"UE4", True), (b"_UE4", True), (b"aUE4 bUE4", False), (b"aUE4 .UE4", True), (bytearray(b"\x00UE4"), True)]
+        self.assertEqual([g.hit(pat, img) for img, _ in cases], [want for _, want in cases])
+
     def test_compressed_segments_and_hashes(self):
         shutil.rmtree(self.root)
         extraction(self.root, compressed=True)
@@ -526,6 +536,12 @@ class Profiles(unittest.TestCase):
         with self.assertRaisesRegex(dp.Invalid, "content version"):
             stage.select(self.root, self.out)
         stage.select(self.root, self.out, version="v0")
+
+    def test_base_only_without_sidecar_uses_base_version(self):
+        # #36：Mac 打包不写旁注，只有本体的游戏。手算期望：update 空、base=4096 → v4096
+        (self.root / "unpack.tsv").write_text("title_id\t" + TID + "\nupdate\t\nbase\t4096\n")
+        (self.root / "direct-profile-input.json").unlink(missing_ok=True)
+        self.assertEqual(stage.options(self.root, TID, None, None, None)["version"], "v4096")
 
     def test_stage_metadata_identity_and_duplicates_reject(self):
         p = self.root / "unpack.tsv"
@@ -878,6 +894,10 @@ class Profiles(unittest.TestCase):
         stub.write_text("#!/bin/sh\ncase \" $* \" in *' --show-sdk-version '*) echo 27.0; exit 0;; *' metal --version '*) echo 'Apple metal version 1'; exit 0;; esac\nexit 1\n")
         stub.chmod(0o755)
         env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+        # direct_lib.sh 开头 source pack/srcs.sh 只为 prog_id，可 srcs.sh 一 source 就按源码哈希在运行根里找 nx_unpack、没有就现编；本例运行根是临时目录，
+        #   每跑一次都 dotnet build 一遍（2–30 秒；门禁里还要排本树 C# 构建锁，曾等到 720 秒超时）。这条路不解包、不跑 nx_unpack：
+        #   给一个不存在的路径（srcs.sh 认 S2A_NX_UNPACK 就不找不编），真用到它会当场报错而不是悄悄绿（11-14 门禁提速）
+        env["S2A_NX_UNPACK"] = str(self.base / "no-nx-unpack-needed")
         p = subprocess.run(["bash", str(REPO / "pack/stage_direct.sh"), "fixture"], env=env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("离线 0 支、运行时首遇现编", p.stdout + p.stderr)
@@ -959,6 +979,7 @@ class Profiles(unittest.TestCase):
         shutil.copyfile(REPO / "graphics/nvn/games/zero_skip.tsv", games / "zero_skip.tsv")   # 出库按程序号挑零源跳过事实写进 game.tsv（direct_lib.sh）
         pack = sandbox / "pack"; pack.mkdir()
         shutil.copyfile(REPO / "pack/srcs.sh", pack / "srcs.sh")
+        (pack / "jobs").mkdir(); shutil.copyfile(REPO / "pack/jobs/space_rule.py", pack / "jobs" / "space_rule.py"); shutil.copyfile(REPO / "pack/jobs/library.py", pack / "jobs" / "library.py")   # 出库开工前的空间复核（#265，direct_lib.sh 调）
         consumer = sandbox / "graphics/tools/direct"; consumer.mkdir(parents=True)
         shutil.copyfile(REPO / "graphics/tools/direct/direct_lib.sh", consumer / "direct_lib.sh")
         shutil.copyfile(REPO / "graphics/tools/direct/extract.sh", consumer / "extract.sh")   # 10-25「抽着色器只做一次」：产物根没有 extract/ 时当场抽（真脚本，抽取器是下面的合成桩）

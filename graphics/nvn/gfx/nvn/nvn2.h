@@ -43,6 +43,18 @@ static inline unsigned nvn2_hsq_count(const void *code, uint32_t ncode) {
     }
     return n;
 }
+// 代码区里半精度「与 sRGB 解码门限 0.04045 比较」HSETP2 Rd, Ra, 0.04045 的条数：操作码 12 位 0x434（低 9 位 0x034 = HSETP2、位 9..11 形式 2 = 寄存器 × 立即数），
+//   立即数在位 32..63、两个半字都是 0x292d（fp16 0.04045）。sRGB → 线性（IEC 61966-2-1：x ≤ 0.04045 → x / 12.92，否则 ((x + 0.055) / 1.055)^2.4）的门限判断就是这一条，
+//   同一段里还有 HMUL2 × 1/12.92（0x2cf5）、HFMA2 + 0.055/1.055（0x2aad）、MUFU LG2 / EX2 与 × 2.4。
+//   直连层用它认张量核超分网络出口层的输出域（nvn_tensor.inc）：一款体育游戏 10 支出口层各 30–80 条（网络在 sRGB 域算、出口解码成线性写出），中间层 0 条
+static inline unsigned nvn2_srgb_count(const void *code, uint32_t ncode) {
+    unsigned n = 0; const uint8_t *c = (const uint8_t *)code;
+    for (uint32_t o = 0; o + 16 <= ncode; o += 16) {
+        uint64_t lo; memcpy(&lo, c + o, 8);
+        if ((lo & 0xfff) == 0x434 && (uint32_t)(lo >> 32) == 0x292d292du) n++;
+    }
+    return n;
+}
 // 着色器键（直连库 / 映射表按它找，抽取器必须同一规则）：sha256(控制段前 0x48 字节，其中 +0x20..+0x27 与 +0x30..+0x33 按 0 ‖ 代码区前 (+0x44) 字节) 的前 8 字节。
 //   +0x20..+0x27：pokopia-native 在 Pokopia 上实测，71 次请求里 6 次只差这 8 字节（运行时被改写）；+0x30：参考实现 在大金刚 Bananza 上实测，文件里是段长、
 //   引擎自建的是 0。code = 代码区的 CPU 地址（NULL / 长度 0 = 只哈希控制段）。返回 1
@@ -66,6 +78,7 @@ int nvn2_device_integer(unsigned item, int *out);
 // nvnDeviceInitialize 时调：贴图 GOB 内次序切到 Switch 2（gfx/tex/nvn_deswizzle.h nvn_gob_switch2），记一行日志
 void nvn2_device_init(void);
 void nvn2_vi_vsync_register(void *f);   // nvn2_codec.c 构造函数登记 vi::GetDisplayVsyncEvent 的实现（nvn2.c 不对视频解码有链接依赖）
+void nvn2_sev_attach_register(uint64_t (*f)(void *sev, int autoclear));   // nvn2_codec.c 构造函数登记「宿主事件挂到游戏 SystemEvent」（nn::chat 的 Attach*ChangedEvent 用；同上，无链接依赖）
 
 // ---------- 宿主做不到的 SDK 函数：红桩（nvn2.c）----------
 // 回一个桩：装载时打红行，被调到就中止并点名 name 与 why（与 sdk 原路径同样中止，但可诊断）；同名复用一个槽，256 槽满回 NULL

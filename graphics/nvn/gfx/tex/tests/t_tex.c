@@ -123,13 +123,30 @@ int main(void) {
         for (unsigned l = 0; l < 3; l++) CHECK(nvn_tex_level_gobs(&d, l) == gobs[l], "S level %u laid out %u GOBs wide, expected %u", l, nvn_tex_level_gobs(&d, l), gobs[l]);
         CHECK(L.size == 0xE0000 && L.align == 0x10000, "S storage %#llx alignment %#x, expected 0xe0000 / 0x10000", (unsigned long long)L.size, L.align);
         printf("  S 1024×1024 ASTC 6×6 sparse: levels at 0, %#llx, %#llx …, storage %#llx (expected 0x90000, 0xd0000, 0xe0000)\n", (unsigned long long)nvn_tex_level_offset(&d, 1), (unsigned long long)nvn_tex_level_offset(&d, 2), (unsigned long long)L.size);
-        d.pkg_block_h = 0; nvn_tex_layout(&d, &L);   // without the packaged layout the sparse page's block height (8 GOBs at 16 bytes a block) gives the same layout
+        d.pkg_layout = 0; nvn_tex_layout(&d, &L);   // without the packaged layout the sparse page's block height (8 GOBs at 16 bytes a block) gives the same layout
         for (unsigned l = 0; l < 8; l++) CHECK(nvn_tex_level_offset(&d, l) == off[l], "S no packaged layout: level %u offset %#llx expected %#llx", l, (unsigned long long)nvn_tex_level_offset(&d, l), (unsigned long long)off[l]);
         CHECK(L.size == 0xE0000 && L.tileH == 3, "S no packaged layout: storage %#llx block height %u, expected 0xe0000 / 3", (unsigned long long)L.size, L.tileH);
-        d.pkg_block_h = 4;
+        d.pkg_layout = 4;
         d.flags = 0; nvn_tex_layout(&d, &L);   // the same texture not sparse keeps the packed layout
         CHECK(nvn_tex_level_offset(&d, 1) == 0x81000 && L.size == 0xBC400 && nvn_tex_level_gobs(&d, 0) == 43, "S not sparse: level 1 %#llx storage %#llx, expected 0x81000 / 0xbc400",
               (unsigned long long)nvn_tex_level_offset(&d, 1), (unsigned long long)L.size);
+    }
+
+    // ---------- P packaged row alignment: byte 1 of NVNpackagedTextureLayout aligns the row pitch to 2^n GOBs (levels at least that wide only) ----------
+    // 01004A4010FEA000's packaged textures almost all carry layout bytes 03 04 (block height 8 GOBs, pitch aligned to 16 GOBs). The same 1024×1024 ASTC 6×6 texture as S, not sparse:
+    // level 0 is 171 block columns = 43 GOBs → 48, level 1 86 → 22 GOBs → 32, level 2 43 → 11 GOBs (< 16, not aligned) — the same padding the sparse tiles give, so the level offsets
+    // equal S's. Read unaligned (level 1 at 0x81000), the padding's all-zero blocks are sampled and ASTC decodes them as magenta (01004A4010FEA000's character menu background)
+    printf("P packaged row alignment (layout byte 1)\n");
+    {
+        nvn_texdesc d = {1, 0x8B, 0, 0, 1024, 1024, 1, 8, 0, (3 | 4 << 8) + 1};   // pkg_layout: layout bytes 03 04 (#676 encoding)
+        static const uint64_t off[8] = {0, 0x90000, 0xD0000, 0xDB000, 0xDE000, 0xDEC00, 0xDF000, 0xDF200};
+        static const uint32_t gobs[3] = {48, 32, 11};
+        for (unsigned l = 0; l < 8; l++) CHECK(nvn_tex_level_offset(&d, l) == off[l], "P level %u offset %#llx expected %#llx", l, (unsigned long long)nvn_tex_level_offset(&d, l), (unsigned long long)off[l]);
+        for (unsigned l = 0; l < 3; l++) CHECK(nvn_tex_level_gobs(&d, l) == gobs[l], "P level %u laid out %u GOBs wide, expected %u", l, nvn_tex_level_gobs(&d, l), gobs[l]);
+        nvn_texlayout L; nvn_tex_layout(&d, &L);
+        CHECK(L.tileH == 3, "P block height %u, expected 3 (byte 0 still read from the low byte)", L.tileH);
+        printf("  P 1024×1024 ASTC 6×6, layout 03 04: level 1 at %#llx (expected 0x90000), level 0/1/2 %u/%u/%u GOBs wide (expected 48/32/11)\n", (unsigned long long)nvn_tex_level_offset(&d, 1),
+               nvn_tex_level_gobs(&d, 0), nvn_tex_level_gobs(&d, 1), nvn_tex_level_gobs(&d, 2));
     }
 
     // Samurai Shodown's 512×512 ASTC 6×6 sparse texture, no packaged layout (10 levels): 86 block columns / rows ≥ a 64×64-block page → level 0 is 2×2 pages = 0x40000
@@ -154,6 +171,24 @@ int main(void) {
         CHECK(tile[0] == 0, "S3 sparse query: %u tiled levels, expected 0 (200 texels < a 384-texel page)", tile[0]);
         CHECK(L.tileH == 2 && nvn_tex_level_gobs(&d, 0) == 30 && L.size == 0x20000, "S3 700×200 block height log2 %u, %u GOBs wide, storage %#llx, expected 2 / 30 / 0x20000",
               L.tileH, nvn_tex_level_gobs(&d, 0), (unsigned long long)L.size);
+    }
+
+    // 线性排布（11-09 质量线 #255 / #262）：去混排按行距逐行拷。期望手写：
+    //   L1 哈迪斯 II 8×8 BGRA8（0x9A，4 字节）LINEAR、stride 32：每行 32 字节原样到输出（输出行距 40，行尾 8 字节不碰）；旧实现对 LINEAR 返回 -1
+    //   L2 没给 stride：行距按 32 对齐 = 32（8 × 4），同 L1
+    //   L3 上古卷轴5 那样 stride 3840 < 宽 1280 × 4 = 5120：返回 -1，输出一字节不写（不越界读）
+    {
+        uint8_t mem[8 * 32], out[8 * 40];
+        for (int i = 0; i < (int)sizeof mem; i++) mem[i] = (uint8_t)(i * 7 + 3);
+        for (int pass = 0; pass < 2; pass++) {
+            nvn_texdesc d = {1, 0x9A, 0x10, 0, 8, 8, 1, 1, pass ? 0u : 32u, 0}; memset(out, 0xEE, sizeof out);
+            int rc = nvn_deswizzle(&d, 0, 0, mem, out, 40), ok = rc == 0;
+            for (int y = 0; y < 8 && ok; y++) ok = !memcmp(out + y * 40, mem + y * 32, 32) && out[y * 40 + 32] == 0xEE && out[y * 40 + 39] == 0xEE;
+            CHECK(ok, "L%d linear 8x8 BGRA stride %s: rc %d, rows copied at pitch 32 / output tail untouched", pass + 1, pass ? "auto" : "32", rc);
+        }
+        nvn_texdesc d = {1, 0x9A, 0x10, 0, 1280, 4, 1, 1, 3840, 0}; static uint8_t big[3840 * 4], bo[5120 * 4]; memset(bo, 0xEE, sizeof bo);
+        int rc = nvn_deswizzle(&d, 0, 0, big, bo, 5120), untouched = 1; for (size_t i = 0; i < sizeof bo; i++) untouched &= bo[i] == 0xEE;
+        CHECK(rc == -1 && untouched, "L3 stride 3840 < 1280 x 4: rc %d (expected -1), output untouched %d", rc, untouched);
     }
 
     printf("%s: %d/%d checks passed\n", fails ? "RED" : "all passed", checks - fails, checks);

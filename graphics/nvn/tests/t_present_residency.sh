@@ -50,7 +50,7 @@ dsx="$out/dsx/mac/libdsx.a"
 
 # 与 runtime/build.mk 的 NVN_TEST_HOST_SRCS 相同：完整 native 源码，排除提供 main 的 host_main.c。
 # 每次从本树源码编对象，避免借用别的工作树或陈旧对象。
-common=(-O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" -I"$root/runtime/include")
+common=(-O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" -I"$root/runtime/include" -I"$root/runtime/ns2pro/include" -DNS2_SCAN_SECONDS=60)   # Mac 前端源文件含 Switch 2 Pro 连接（macos/ns2_controller.c、runtime/ns2pro，#277），同 launchers/macos/build.mk
 objects=()
 for src in "$root"/runtime/src/*.c "$root"/runtime/src/*.S "$root/platform/apple/plat_apple.c" "$root/graphics/track/track.c" "$root/graphics/track/glue.c"; do
     rel=${src#"$root"/}
@@ -72,7 +72,8 @@ for rel in "${front_srcs[@]}"; do
 done
 # 只打印生产构建定义的弱引用参数，不运行 runtime/build.mk 的构建配方。
 # 例如自动玩家在本集成测试中不链接；缺省弱引用须保持为空，不能提供替身。
-weak_output=$(printf '%s\n' 'present-residency-weak:;@echo $(NVN_TEST_WEAK)' | \
+# 原生层链接库同生产（runtime/build.mk 的 HOST_LIBS：Foundation、Security 等）：本脚本整目录编 runtime/src，手写框架表会漏新依赖（11-17 selfsign.c 加 Security 后这里链接红）
+weak_output=$(printf '%s\n' 'present-residency-weak:;@echo $(NVN_TEST_WEAK) $(HOST_LIBS)' | \
     make -s -f "$root/runtime/build.mk" -f - present-residency-weak)
 read -r -a weak_flags <<< "$weak_output"
 xcrun --sdk macosx clang "${common[@]}" -std=gnu11 -fobjc-arc \
@@ -81,7 +82,7 @@ xcrun --sdk macosx clang "${common[@]}" -std=gnu11 -fobjc-arc \
     "$nvn" "$gal" "$dsx" "$widen" -o "$out/t_present_residency" \
     -Wl,-dead_strip -Wl,-export_dynamic -Wl,-u,_s2a_mac_front_layer -Wl,-u,_nxgal_gpu_hold "${weak_flags[@]}" \
     -Wl,-rpath,"$(dirname "$widen")" \
-    -framework AppKit -framework GameController -framework Metal -framework Foundation \
+    -framework AppKit -framework GameController -framework CoreHaptics -framework CoreBluetooth -framework IOKit -framework Metal -framework Foundation \
     -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -lc++
 # -u 拉入真实前端与 GAL 定义；仅沿用 NVN_TEST_WEAK 的生产弱引用放行，不启用 dynamic_lookup。
 shasum -a 256 "$root/graphics/nvn/tests/t_present_residency.m" "${objects[@]}" "$nvn" "$gal" "$dsx" "$widen" \

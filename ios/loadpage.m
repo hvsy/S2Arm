@@ -4,8 +4,19 @@
 // 之后的启动：只有图标、标题和一个小转圈，首帧上屏就淡出。素材取本地资源包（icon.jpg、ctl/control.nacp），不外传。
 // 主线程每 0.25 秒读一次模型快照；页面压在根视图最上层（虚拟手柄等后挂的视图也压不住它），首帧后 0.35 秒淡出并移除。
 #import <UIKit/UIKit.h>
+#import "tv_compat.h"
+#import "s2a_l10n.h"
 #include "s2a_loadprog.h"
 uint64_t now_ns(void);
+
+// 剩余时间小字：档位同 runtime/src/loadprog.c s2a_load_eta_text（<0 估算中 / <5 秒 / 逐秒 / 分秒 / 整分），文字按 App 语言取字符串表（#316），中文值与那份 C 原句逐字相同
+static NSString *eta_text(int s) {
+    if (s < 0) return S2AL(@"loadpage.eta.estimating");
+    if (s < 5) return S2AL(@"loadpage.eta.under5s");
+    if (s < 60) return [NSString stringWithFormat:S2AL(@"loadpage.eta.seconds"), s];
+    if (s % 60) return [NSString stringWithFormat:S2AL(@"loadpage.eta.minSec"), s / 60, s % 60];
+    return [NSString stringWithFormat:S2AL(@"loadpage.eta.minutes"), s / 60];
+}
 
 // ---------- 素材 ----------
 static NSString *game_data_dir(void) {
@@ -66,7 +77,7 @@ static UILabel *label(CGFloat size, UIFontWeight w, UIColor *c) {
     _backdrop = [[UIImageView alloc] initWithImage:ic]; _backdrop.contentMode = UIViewContentModeScaleAspectFill; _backdrop.clipsToBounds = YES;
     _backdrop.frame = self.bounds; _backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; _backdrop.alpha = 0.9;
     [self addSubview:_backdrop];
-    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:S2A_BLUR_MATERIAL_DARK]];
     blur.frame = self.bounds; blur.autoresizingMask = _backdrop.autoresizingMask; [self addSubview:blur];
 
     _icon = [[UIImageView alloc] initWithImage:rounded]; _icon.translatesAutoresizingMaskIntoConstraints = NO; _icon.contentMode = UIViewContentModeScaleAspectFill;
@@ -86,12 +97,12 @@ static UILabel *label(CGFloat size, UIFontWeight w, UIColor *c) {
         return self;
     }
 
-    _subtitle = label(15, UIFontWeightRegular, UIColor.secondaryLabelColor); _subtitle.text = @"首次启动，正在为你的设备做一次性准备";
+    _subtitle = label(15, UIFontWeightRegular, UIColor.secondaryLabelColor); _subtitle.text = S2AL(@"loadpage.subtitle");
     UIStackView *head = [[UIStackView alloc] initWithArrangedSubviews:@[_title, _subtitle]]; head.axis = UILayoutConstraintAxisVertical; head.spacing = 4;
     UIStackView *top = [[UIStackView alloc] initWithArrangedSubviews:@[_icon, head]]; top.axis = UILayoutConstraintAxisHorizontal; top.spacing = 18; top.alignment = UIStackViewAlignmentCenter;
 
     // 三段步骤
-    NSArray *names = @[@"准备游戏数据", @"为你的设备优化画面", @"进入游戏"];
+    NSArray *names = @[S2AL(@"loadpage.step.data"), S2AL(@"loadpage.step.optimize"), S2AL(@"loadpage.step.enter")];
     NSMutableArray *dots = [NSMutableArray array], *labs = [NSMutableArray array], *items = [NSMutableArray array];
     for (NSString *n in names) {
         UIImageView *dot = [UIImageView new]; dot.translatesAutoresizingMaskIntoConstraints = NO; dot.contentMode = UIViewContentModeScaleAspectFit;
@@ -103,7 +114,7 @@ static UILabel *label(CGFloat size, UIFontWeight w, UIColor *c) {
     _stepDots = dots; _stepLabels = labs;
     UIStackView *steps = [[UIStackView alloc] initWithArrangedSubviews:items]; steps.spacing = 22; steps.alignment = UIStackViewAlignmentCenter;
 
-    _bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleBar]; _bar.translatesAutoresizingMaskIntoConstraints = NO;
+    _bar = [[UIProgressView alloc] initWithProgressViewStyle:S2A_PROGRESS_BAR]; _bar.translatesAutoresizingMaskIntoConstraints = NO;
     _bar.progressTintColor = [UIColor colorWithWhite:1 alpha:0.92]; _bar.trackTintColor = [UIColor colorWithWhite:1 alpha:0.14];
     _bar.layer.cornerRadius = 2; _bar.clipsToBounds = YES;
     _detail = label(13, UIFontWeightRegular, UIColor.secondaryLabelColor);
@@ -113,10 +124,10 @@ static UILabel *label(CGFloat size, UIFontWeight w, UIColor *c) {
     UIStackView *under = [[UIStackView alloc] initWithArrangedSubviews:@[_detail, _eta]]; under.spacing = 12;
     UIStackView *prog = [[UIStackView alloc] initWithArrangedSubviews:@[_bar, under]]; prog.axis = UILayoutConstraintAxisVertical; prog.spacing = 8;
 
-    _footnote = label(12, UIFontWeightRegular, UIColor.tertiaryLabelColor); _footnote.text = @"只在首次启动时进行，之后启动只需几秒。";
+    _footnote = label(12, UIFontWeightRegular, UIColor.tertiaryLabelColor); _footnote.text = S2AL(@"loadpage.footnote");
 
     UIButtonConfiguration *c = [UIButtonConfiguration filledButtonConfiguration];
-    c.title = @"先开始玩，后台继续优化"; c.subtitle = @"少数画面效果会先用近似版本，优化完成后自动换上";
+    c.title = S2AL(@"loadpage.skip"); c.subtitle = S2AL(@"loadpage.skip.note");
     c.baseBackgroundColor = [UIColor colorWithWhite:1 alpha:0.14]; c.baseForegroundColor = UIColor.labelColor;
     c.cornerStyle = UIButtonConfigurationCornerStyleCapsule; c.titleAlignment = UIButtonConfigurationTitleAlignmentCenter;
     c.contentInsets = NSDirectionalEdgeInsetsMake(10, 22, 10, 22);
@@ -151,11 +162,11 @@ static UILabel *label(CGFloat size, UIFontWeight w, UIColor *c) {
         self.stepLabels[i].textColor = cur ? UIColor.labelColor : done ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
     }
     NSNumberFormatter *nf = [NSNumberFormatter new]; nf.numberStyle = NSNumberFormatterDecimalStyle;
-    if (v.stage == S2A_LOAD_DATA) { self.detail.text = @"正在准备游戏数据"; self.eta.text = @""; }
+    if (v.stage == S2A_LOAD_DATA) { self.detail.text = S2AL(@"loadpage.data"); self.eta.text = @""; }
     else if (v.stage == S2A_LOAD_OPTIMIZE) {
-        self.detail.text = [NSString stringWithFormat:@"已优化 %@ / %@ 项", [nf stringFromNumber:@(v.done)], [nf stringFromNumber:@(v.total)]];
-        char b[64]; s2a_load_eta_text(v.eta_s, b, sizeof b); self.eta.text = v.eta_s >= 0 ? [NSString stringWithFormat:@"剩余%@", @(b)] : @(b);
-    } else { self.detail.text = v.go_reason == S2A_LOAD_GO_DONE ? @"优化完成，正在进入游戏" : @"正在进入游戏，剩余的优化在后台继续"; self.eta.text = @""; }
+        self.detail.text = [NSString stringWithFormat:S2AL(@"loadpage.optimized"), [nf stringFromNumber:@(v.done)], [nf stringFromNumber:@(v.total)]];
+        NSString *b = eta_text(v.eta_s); self.eta.text = v.eta_s >= 0 ? [NSString stringWithFormat:S2AL(@"loadpage.remaining"), b] : b;
+    } else { self.detail.text = v.go_reason == S2A_LOAD_GO_DONE ? S2AL(@"loadpage.go.done") : S2AL(@"loadpage.go.early"); self.eta.text = @""; }
     if (v.can_skip && self.skip.hidden) { self.skip.hidden = NO; [UIView animateWithDuration:0.4 animations:^{ self.skip.alpha = 1; }]; }
     else if (!v.can_skip && !self.skip.hidden) { [UIView animateWithDuration:0.2 animations:^{ self.skip.alpha = 0; } completion:^(BOOL f) { (void)f; self.skip.hidden = YES; }]; }
 }
@@ -169,6 +180,7 @@ void s2a_loadpage_attach(UIView *root) {
     if (v.stage == S2A_LOAD_DONE) return;
     g_page = [[S2ALoadPage alloc] initWithFrame:root.bounds firstRun:v.first_run];
     [root addSubview:g_page]; [g_page refresh];
+    { void s2a_report_gear_attach(UIView *); s2a_report_gear_attach(g_page); }   // 左上角小齿轮：故障报修（加载 / 解包时也找得到上传入口）
     __weak S2ALoadPage *w = g_page;
     g_page.timer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { (void)t; [w refresh]; }];
 }

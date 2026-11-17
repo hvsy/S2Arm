@@ -57,6 +57,16 @@ int main(int argc, char **argv) {
     check(s2a_system_action(state(false, false, false, true, false)) == S2A_SYS_NONE,
           "后台且没有当前对象 → 什么都不做");
     check(S2A_SYSTEM_RECHECK_MS == 200, "复查延迟是 200ms");
+    // ---- #1428 接线：NS2 Pro 和系统手柄一视同仁分槽，系统手柄不再挡 NS2 Pro ----
+    check(count_in(source, "_hasSystem") == 0, "#1428：不再有「有系统手柄就不连 / 停掉 NS2 Pro」的门槛（原 8 处 _hasSystem）");
+    check(count_in(source, "system controller selected") == 0, "#1428：选到系统手柄时不停 NS2 Pro");
+    check(count_in(source, "ids[n] = &g_ble_slot_tag") == 1, "#1428：NS2 Pro 连着就参加 s2a_slot_plan 分槽");
+    check(count_in(source, "if (slot == 0) s2a_pad_update(S2A_PAD_BLE, 1, (uint32_t)state->buttons, axes)") == 1,
+          "#1428：NS2 Pro 输入按占的槽走（槽 0 才进 pad.c 当玩家 1）");
+    check(count_in(source, "atomic_store(&g_slot_buttons[slot], (uint32_t)state->buttons & S2A_PAD_KEYS)") == 1,
+          "#1428：NS2 Pro 占玩家 2–4 时写那个槽");
+    check(count_in(source, "s2a_pad_update(S2A_PAD_BLE, ready, 0, axes)") == 0, "#1428：NS2 Pro 就绪不直接当玩家 1，等分槽");
+    check(count_in(source, "if (_slotId[slot] == &g_ble_slot_tag) return;") == 1, "#1428：分槽刷新不把 NS2 Pro 的槽清零");
 
     // ---- 接线：controller.m 真的按这套决策走 ----
     check(count_in(source, "[controllers containsObject:") == 0,
@@ -73,13 +83,17 @@ int main(int argc, char **argv) {
     check(count_in(source, "S2A_SYSTEM_RECHECK_MS") >= 2, "controller.m 用统一的复查延迟常量");
     check(strstr(source, "从快照消失") != NULL && strstr(source, "确认断开") != NULL && strstr(source, "已恢复") != NULL,
           "断开日志三态齐全（延迟确认中 / 确认断开 / 已恢复）");
-    check(count_in(source, "dispatch_after(") == 1, "延迟复查只有一个 dispatch_after 入口");
+    // 只数复查用的 dispatch_after（按复查延迟常量认）：别的定时用途（如菜单切震动档位的 0.3 秒试震停止）不是复查入口（11-09）
+    check(count_in(source, "dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(S2A_SYSTEM_RECHECK_MS") == 1, "延迟复查只有一个 dispatch_after 入口");
 
     // ---- 接线：「-」/「+」不再被系统手势吃掉（Minus 延迟的真根因，与本 PR 的判活健壮性独立）----
     // 「-」用 Disabled：手势识别器完全不跑、输入直接给 app。AlwaysReceive 已废弃且语义是「同时给手势识别器」
     //   （真机现象：按 Minus 触发录屏），这里断言它一处都不许出现，防止有人改回去。
-    check(count_in(source, "preferredSystemGestureState = GCSystemGestureStateDisabled") == 1,
-          "「-」设 Disabled（手势不跑，输入直接给 app）");
+    check(count_in(source, "preferredSystemGestureState = GCSystemGestureStateDisabled") == 2,
+          "「-」与 Home 设 Disabled（手势不跑，输入直接给 app）");
+    // #276：Home 关掉系统手势（否则系统拿去开游戏面板），并放进扩展位 bit16 供长按开局内菜单
+    check(strstr(source, "pad.buttonHome.preferredSystemGestureState = GCSystemGestureStateDisabled") != NULL, "Home 设 Disabled");
+    check(strstr(source, "if (pad.buttonHome.isPressed) buttons |= 1u << 16;") != NULL, "Home 进扩展位 bit16");
     check(count_in(source, "GCSystemGestureStateAlwaysReceive") == 0,
           "没有再用已废弃的 AlwaysReceive（它语义是「同时给手势识别器」，会触发录屏）");
     check(count_in(source, "buttonMenu.preferredSystemGestureState") == 0,

@@ -22,7 +22,7 @@ public struct InstallItem: Identifiable, Equatable {
     }
 }
 
-/// 装机前清单：全齐了才让点「开始装」。
+/// 装机前清单：ready 由作业层判定（只有 iPhone 版没做好才挡），其余项只提示。
 public struct InstallReadiness: Equatable {
     public let items: [InstallItem]
     public let ready: Bool
@@ -30,25 +30,79 @@ public struct InstallReadiness: Equatable {
     public let device: String
     /// 本机签名团队名。
     public let account: String
+    /// 这款最新的 .ipa；还没做好 iPhone 版时为空。
+    public let ipaPath: String
+    /// 诊断用：Xcode 版本和账号、团队、证书的数量，不含账号和团队名。
+    public let signing: String
 
-    public init(items: [InstallItem], ready: Bool, device: String = "", account: String = "") {
-        self.items = items; self.ready = ready; self.device = device; self.account = account
+    public init(items: [InstallItem], ready: Bool, device: String = "", account: String = "", ipaPath: String = "", signing: String = "") {
+        self.items = items; self.ready = ready; self.device = device; self.account = account; self.ipaPath = ipaPath; self.signing = signing
     }
 
     public init(result r: [String: Any]) {
         let items = (r["items"] as? [[String: Any]] ?? []).compactMap(InstallItem.init(json:))
-        // 作业层的 ready 与逐项都要齐：两边不一致时按没齐算
-        self.init(items: items, ready: (r["ready"] as? Bool ?? false) && !items.isEmpty && items.allSatisfy(\.ok),
-                  device: r["device"] as? String ?? "", account: r["account"] as? String ?? "")
+        self.init(items: items, ready: r["ready"] as? Bool ?? false,
+                  device: r["device"] as? String ?? "", account: r["account"] as? String ?? "", ipaPath: r["ipaPath"] as? String ?? "", signing: r["signing"] as? String ?? "")
+    }
+}
+
+/// 开发者证书体检（devCert 作业，pack/jobs/devcert.py inspect）：问题只提示、不挡；blocking 非空 = 根本签不了。
+public struct DevCertInfo: Equatable {
+    public let teamName, teamId, certName, certExpires, profileName, profileExpires, bundleId: String
+    public let wildcard, allDevices: Bool
+    public let deviceCount: Int
+    /// 连着的手机在不在设备列表：nil = 没连手机 / 不知道。
+    public let deviceListed: Bool?
+    public let blocking: [String]
+    public let warnings: [String]
+
+    public init(result r: [String: Any]) {
+        func s(_ k: String) -> String { r[k] as? String ?? "" }
+        teamName = s("teamName"); teamId = s("teamId"); certName = s("certName"); certExpires = s("certExpires")
+        profileName = s("profileName"); profileExpires = s("profileExpires"); bundleId = s("bundleId")
+        wildcard = r["wildcard"] as? Bool ?? false; allDevices = r["allDevices"] as? Bool ?? false
+        deviceCount = (r["deviceCount"] as? NSNumber)?.intValue ?? 0
+        deviceListed = r["deviceListed"] as? Bool
+        blocking = (r["blocking"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
+        warnings = (r["warnings"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
+    }
+}
+
+/// 开发者证书现况：导入过没有、出包装机用不用它、体检结果。
+public struct DevCertStatus: Equatable {
+    public let imported: Bool
+    public let active: Bool
+    public let cert: DevCertInfo?
+    public init(imported: Bool, active: Bool, cert: DevCertInfo?) { self.imported = imported; self.active = active; self.cert = cert }
+    public init(result r: [String: Any]) {
+        self.init(imported: r["imported"] as? Bool ?? false, active: r["active"] as? Bool ?? false, cert: (r["cert"] as? [String: Any]).map(DevCertInfo.init(result:)))
     }
 }
 
 /// 装好的结果。
 public struct InstallResult: Equatable {
     public let device: String
+    /// 实际装上的那台：类型「iPhone」/「iPad」与设备名（完成页、顶部胶囊写这个，不写死 iPhone；Windows 拿不到设备名时为空）
+    public var deviceKind: String = ""
+    public var deviceName: String = ""
     /// 推到手机上的资源包文件数（没推为 nil）。
     public let packFiles: Int?
     public let outputPath: String?
+    /// 这次实际推到手机上的资源包字节数（作业结果 packBytes；0 = 一个都没推）
+    public var packBytes: Int64? = nil
+    /// 这次推的全是单一 IMG：已传到手机、打开 S2Arm 会自动完成安装（作业结果 openToFinish）
+    public var openToFinish: Bool = false
+    /// 导出模式（装法选了「导出，自己签名安装」）：没连手机，S2Arm.ipa + 各款 .img + 说明放进的文件夹（作业结果 exported / outputPath）；一键装为空
+    public var exportFolder: String = ""
+    /// 导出了几款、文件夹总字节数、没放进这次导出的款（要按新版重新出包，作业结果 skipped 是游戏名）
+    public var exportGames: Int = 0
+    public var exportBytes: Int64? = nil
+    public var skipped: [String] = []
+    /// 这次新写的 .img 文件名与沿用上次导出的款数（#1132：沿用的和上次逐字节相同，手机上已有就不用再拷；作业结果 fresh / reused）
+    public var exportFresh: [String] = []
+    public var exportReused: Int = 0
+    /// 只新写点的那款时，别的款里这次没写 .img 的（游戏名，作业结果 unwritten）：手机上已有照常能玩，没有要点那款再导出
+    public var exportUnwritten: [String] = []
 }
 
 /// 从手机删一款的结果（installRemove 作业，pack/jobs/install.py remove_from_phone）。
@@ -80,20 +134,125 @@ public final class InstallService {
     public init(client: JobClient) { self.client = client }
 
     /// 装机前清单。只读：不申请描述文件、不签名、不碰设备上的 App。
-    public func readiness(gameId: String) async throws -> InstallReadiness {
-        InstallReadiness(result: try await client.perform("installCheck", extra: ["gameId": gameId]).result)
+    /// device：玩家选的那台（清单只看它、每次现查；不给时作业不替玩家挑，「已连上」那项不打勾）
+    public func readiness(gameId: String, device: String? = nil) async throws -> InstallReadiness {
+        var extra: [String: Any] = ["gameId": gameId]
+        if let device, !device.isEmpty { extra["device"] = device }
+        return InstallReadiness(result: try await client.perform("installCheck", extra: extra).result)
     }
 
     /// 装。
-    public func install(gameId: String, events: EventSink = .discard) async throws -> InstallResult {
-        let r = try await client.perform("install", extra: ["gameId": gameId], events: events).result
-        return InstallResult(device: r["device"] as? String ?? "", packFiles: (r["packFiles"] as? NSNumber)?.intValue,
-                             outputPath: r["outputPath"] as? String)
+    /// device：要装的那台（UDID / 设备名），必须给：作业层不替玩家挑，不给即报 device_required（pack/jobs/install.py phone）
+    /// acceptDropped：玩家已确认「手机上只在别的电脑装过的游戏这次带不上」（作业层 container_would_drop 之后再点）
+    /// mode = "export"：游戏库「导出自签包」——不连手机、不签名，出未签名 S2Arm.ipa 和各款 .img 到文件夹（11-15 起导出只看这次请求）
+    /// widget = false：玩家在设置里关了「装到 iPhone 时带主屏小组件」，作业层不带小组件扩展（不传 = 带）
+    public func install(gameId: String, teamId: String? = nil, device: String? = nil, acceptDropped: Bool = false, accept: Set<String> = [], mode: String? = nil,
+                        widget: Bool = true, events: EventSink = .discard) async throws -> InstallResult {
+        var extra: [String: Any] = ["gameId": gameId]
+        if !widget { extra["widget"] = false }
+        if let mode { extra["mode"] = mode }
+        if acceptDropped { extra["acceptDropped"] = true }
+        for key in accept { extra[key] = true }   // 玩家在结局页确认过的（acceptDropped / acceptNoBackup / acceptStale，作业层按码认）
+        if let teamId, !teamId.isEmpty { extra["teamId"] = teamId }
+        if let device, !device.isEmpty { extra["device"] = device }
+        let r = try await client.perform("install", extra: extra, events: events).result
+        return InstallResult(device: r["device"] as? String ?? "", deviceKind: r["deviceKind"] as? String ?? "", deviceName: r["deviceName"] as? String ?? "",
+                             packFiles: (r["packFiles"] as? NSNumber)?.intValue, outputPath: r["outputPath"] as? String, packBytes: (r["packBytes"] as? NSNumber)?.int64Value,
+                             openToFinish: r["openToFinish"] as? Bool ?? false,
+                             exportFolder: r["exported"] as? Bool == true ? r["outputPath"] as? String ?? "" : "",
+                             exportGames: (r["games"] as? [Any])?.count ?? 0, exportBytes: (r["exportBytes"] as? NSNumber)?.int64Value,
+                             skipped: r["skipped"] as? [String] ?? [],
+                             exportFresh: r["fresh"] as? [String] ?? [], exportReused: (r["reused"] as? NSNumber)?.intValue ?? 0,
+                             exportUnwritten: r["unwritten"] as? [String] ?? [])
+    }
+
+    /// 推到手机（exportPush，pack/jobs/install.py push_export_job）：把「S2Arm 自签导出」里的完整 .img 推进手机上自签 S2Arm 的「放这里导入」。
+    ///   gameId 为 nil = 文件夹里全部；→ 推进去的文件名。推不了抛 JobFailure（原因 + 下一步：连线 / 信任 / 先装 S2Arm.ipa）
+    public func exportPush(gameId: String?, device: String? = nil, events: EventSink = .discard) async throws -> [String] {
+        var extra: [String: Any] = [:]
+        if let gameId, !gameId.isEmpty { extra["gameId"] = gameId }
+        if let device, !device.isEmpty { extra["device"] = device }
+        return try await client.perform("exportPush", extra: extra, events: events).result["pushed"] as? [String] ?? []
+    }
+
+    // ---- 开发者证书（v0.2.4，pack/jobs/devcert.py）----
+
+    /// 现况 + 体检；device = 连着的手机 UDID（判在不在设备列表），不给就不判。
+    public func devCertStatus(device: String? = nil) async throws -> DevCertStatus {
+        var extra: [String: Any] = ["action": "status"]
+        if let device, !device.isEmpty { extra["device"] = device }
+        return DevCertStatus(result: try await client.perform("devCert", extra: extra).result)
+    }
+
+    /// 导入 .p12 + .mobileprovision；密码只经环境变量给这一次作业（S2A_DEVCERT_PASSWORD），不写进请求文件。导入成功即切到证书签名。
+    public func devCertImport(p12: String, profile: String, password: String, device: String? = nil) async throws -> DevCertInfo {
+        var extra: [String: Any] = ["action": "import", "p12Path": p12, "profilePath": profile]
+        if let device, !device.isEmpty { extra["device"] = device }
+        return DevCertInfo(result: try await client.perform("devCert", extra: extra, secrets: ["S2A_DEVCERT_PASSWORD": password]).result)
+    }
+
+    /// 出包装机用开发者证书（true）还是 Apple ID（false）。
+    public func devCertUse(_ active: Bool) async throws {
+        _ = try await client.perform("devCert", extra: ["action": "use", "active": active])
+    }
+
+    /// 删掉本机存的证书、描述文件和钥匙串里的密码（回到 Apple ID 签名）。
+    public func devCertDelete() async throws {
+        _ = try await client.perform("devCert", extra: ["action": "delete"])
+    }
+
+    /// 生成给「没有签名团队」玩家用的 Xcode 引导项目，返回项目路径。
+    public func signingProject() async throws -> String {
+        try await client.perform("signingProject", extra: [:], events: .discard).result["path"] as? String ?? ""
+    }
+
+    /// 签名身份（installMode 作业只读；11-15 起导出不再是装法，旧版的装法设置由作业层迁移删掉）
+    public func installMode() async throws -> InstallModeInfo {
+        InstallModeInfo(result: try await client.perform("installMode").result)
+    }
+
+    /// 更新 iPhone 上的 S2Arm（installUpdate 作业，install.update_phone）：本版壳 + 已有程序模块，只装 App；
+    ///   有要重新出包的款且没 acceptStale → 作业以 container_stale 失败（界面先问玩家）
+    ///   device：连着多台时装到哪台（同 install；不给 = 只连着一台）
+    /// acceptDropped：同 install——玩家已确认手机上只在别的电脑装过的游戏这次带不上（作业层 container_would_drop）
+    /// mode：这次按「一键装到 iPhone」（install）/「导出自己签名安装」（export）走，nil = 按设置里的装法；sgradeUpgrade：「S 级优化升级」页发起，壳已是本版也重组装上
+    public func updatePhone(acceptStale: Bool = false, acceptDropped: Bool = false, accept: Set<String> = [], mode: String? = nil, sgradeUpgrade: Bool = false, device: String? = nil,
+                            widget: Bool = true, events: EventSink = .discard) async throws -> [String: Any] {
+        var extra: [String: Any] = acceptStale ? ["acceptStale": true] : [:]
+        if !widget { extra["widget"] = false }
+        if acceptDropped { extra["acceptDropped"] = true }
+        for key in accept { extra[key] = true }
+        if let device { extra["device"] = device }
+        if let mode { extra["mode"] = mode }
+        if sgradeUpgrade { extra["sgradeUpgrade"] = true }
+        return try await client.perform("installUpdate", extra: extra, events: events).result
+    }
+
+    /// 装回只换宿主前的那一版手机 S2Arm（installRestore 作业，pack/jobs/install.py restore_previous）。
+    public func restorePrevious(device: String? = nil, events: EventSink = .discard) async throws {
+        _ = try await client.perform("installRestore", extra: device.map { ["device": $0] } ?? [:], events: events)
     }
 
     /// 从手机容器删一款（installRemove 作业）。
-    public func remove(gameId: String, events: EventSink = .discard) async throws -> RemoveResult {
-        let r = try await client.perform("installRemove", extra: ["gameId": gameId], events: events).result
+    /// accept：同 install——玩家在结局页确认过的参数（删前没能备份存档 save_backup_failed → acceptNoBackup 等）
+    public func remove(gameId: String, acceptDropped: Bool = false, accept: Set<String> = [], device: String? = nil, events: EventSink = .discard) async throws -> RemoveResult {
+        var extra: [String: Any] = ["gameId": gameId]
+        if let device, !device.isEmpty { extra["device"] = device }
+        if acceptDropped { extra["acceptDropped"] = true }
+        for key in accept { extra[key] = true }
+        let r = try await client.perform("installRemove", extra: extra, events: events).result
         return RemoveResult(result: r)
+    }
+}
+
+/// 签名身份（installMode 作业）：signMode = devcert（我的开发者证书）/ appleId；exportAvailable = 导出作业在不在
+public struct InstallModeInfo: Equatable, Sendable {
+    public let exportAvailable: Bool
+    public let signMode: String
+    public init(exportAvailable: Bool = false, signMode: String = "appleId") {
+        self.exportAvailable = exportAvailable; self.signMode = signMode
+    }
+    init(result r: [String: Any]) {
+        self.init(exportAvailable: r["exportAvailable"] as? Bool ?? false, signMode: r["signMode"] as? String ?? "appleId")
     }
 }

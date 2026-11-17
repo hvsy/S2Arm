@@ -1,5 +1,6 @@
 // S2Arm（不是上游文件）：本包对外唯一入口。launchers/macos 的 S2ArmApple 可执行 target 只用这里的 public 类型装配，
 // 上游各 target 之间的 package 级类型不外露（package 访问级别不跨 SwiftPM 包）。
+import AppKit
 import SwiftUI
 import NXCore
 import NXModel
@@ -18,6 +19,12 @@ public struct S2ArmAppleRootView: View {
     }
 
     public var body: some View {
-        LauncherView(model: model, brand: brand).environmentObject(loc)
+        LauncherView(model: model, brand: brand)
+            .environmentObject(loc)
+            .onAppear { model.setUILanguage(loc.lang.sharedCode) }   // 作业请求带界面语言（JobEnvironment.uiLanguage）：导出文件夹 / 说明等按它出
+            .onReceive(loc.objectWillChange.receive(on: RunLoop.main)) { _ in model.setUILanguage(loc.lang.sharedCode) }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                model.shutdownControllerConnection()
+            }
     }
 }

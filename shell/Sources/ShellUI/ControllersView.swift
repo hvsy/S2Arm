@@ -9,8 +9,11 @@ public struct ControllersView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     public var controllers: [ControllerInfo]
     public var onBack: () -> Void
-    public init(controllers: [ControllerInfo], onBack: @escaping () -> Void = {}, padMap: PadMap = PadMap()) {
+    /// False when the host has no handler for the shell's own button mapping: its row is not shown.
+    public var showsMapping: Bool
+    public init(controllers: [ControllerInfo], onBack: @escaping () -> Void = {}, padMap: PadMap = PadMap(), showsMapping: Bool = true) {
         self.padMap = padMap
+        self.showsMapping = showsMapping
         self.controllers = controllers
         self.onBack = onBack
     }
@@ -35,7 +38,8 @@ public struct ControllersView: View {
                         Image(systemName: "gamecontroller").font(.system(size: 30, weight: .light))
                             .foregroundStyle(ShellPalette.cream).accessibilityHidden(true).padding(.bottom, 4)
                         Text(ShellStrings.text("No controllers connected")).shellText(19, .bold)
-                        Text(ShellStrings.text("Connect a controller in Bluetooth settings. Touch controls are always available in the library."))
+                        // tvOS 没有触屏，后半句不说
+                        Text(ShellStrings.text(Self.noControllerNote))
                             .shellText(14.5).foregroundStyle(.white.opacity(0.6)).fixedSize(horizontal: false, vertical: true)
                     }.frame(maxWidth: .infinity, alignment: .leading).shellCard(padding: 20)
                 } else {
@@ -59,11 +63,19 @@ public struct ControllersView: View {
                     hint(ButtonGlyph(role: .settings), ShellStrings.text("Game settings"))
                     hint(ButtonGlyph(role: .controllers), ShellStrings.text("Controllers"))
                 }.padding(.horizontal, 4)
-            }.padding(24).padding(.bottom, geometry.safeAreaInsets.bottom).frame(maxWidth: 640)
+            }.padding(24).padding(.bottom, geometry.safeAreaInsets.bottom).frame(maxWidth: 640 * ShellFonts.tvScale)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollIndicators(.hidden)
-        .ignoresSafeArea(edges: .bottom)
+        // This page is an overlay on the screen's trailing edge — the library gives it the pane's width
+        // and trailing alignment — so the window's horizontal safe insets are positional: the frame
+        // already ends at the safe edge, and a scroll view that also insets its content for them spends
+        // the trailing inset (59pt in landscape) a second time inside the page, truncating every card
+        // and row on the right (device-measured right margin ≈89pt against the game pane's 24). The
+        // horizontal pair is ignored here, as the game settings pane ignores every edge; the top inset
+        // still positions the header where the page takes the whole width, and the bottom was already
+        // ignored with the content's own bottom padding below.
+        .modifier(TrailingOverlaySafeArea())   // 横向不扣安全区；灵动岛转到右边时右侧照扣（SensorEdge.swift）
         .onChange(of: focus.id) { _, id in
             guard let id, id.hasPrefix("ctl.") else { return }
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) {
@@ -78,10 +90,20 @@ public struct ControllersView: View {
     private var mapping: some View {
         VStack(alignment: .leading, spacing: 14) {
             SectionHeading(title: ShellStrings.text("Buttons"))
-            PadMappingEntryRow(gameID: Self.mappingID, rows: PadMappingRows.global(padMap), targetID: "ctl.mapping").id("ctl.mapping")
+            if showsMapping {
+                PadMappingEntryRow(gameID: Self.mappingID, rows: PadMappingRows.global(padMap), targetID: "ctl.mapping").id("ctl.mapping")
+            }
+            #if !os(tvOS)   // tvOS：A / B / 菜单键被系统焦点接走（B = 返回），按键测试测不全，不出
             ButtonTestEntryRow().id("ctl.test")
+            #endif
         }
     }
+
+    #if os(tvOS)
+    static let noControllerNote: String.LocalizationValue = "Connect a controller in Bluetooth settings."
+    #else
+    static let noControllerNote: String.LocalizationValue = "Connect a controller in Bluetooth settings. Touch controls are always available in the library."
+    #endif
 
     private func hint(_ icon: some View, _ label: String) -> some View {
         HStack(spacing: 14) {

@@ -8,7 +8,7 @@ struct TasksView: View {
     var body: some View {
         WorkspacePage {
             WorkspaceHeading(title:"编译任务",subtitle:"",symbol:"checklist") {
-                Button(L("打开日志")) {store.reveal(store.privateRoot.appendingPathComponent("logs"))}.platformButtonStyle()
+                Button(L("打开日志")) {store.reveal(store.logsRoot)}.platformButtonStyle()
             }
             HStack(spacing:8) {
                 StatusPill(title:"进行中 \(store.activeTasks.count)",symbol:"circle.dotted")
@@ -218,7 +218,7 @@ struct GameContentLine: View {
         if let base { out.append(("shippingbox", L("本体 ") + (base.display.isEmpty ? "v\(base.version)" : base.display))) }
         if let last = updates.last { out.append(("arrow.triangle.2.circlepath", L("更新 ") + (last.display.isEmpty ? "v\(last.version)" : last.display))) }
         if dlc > 0 { out.append(("puzzlepiece.extension", "DLC \(dlc)")) }
-        let bytes = game.packages.reduce(Int64(0)) { $0 + $1.size }
+        let bytes = game.sourceBytes
         if bytes > 0 { out.append(("internaldrive", ByteCountFormatter.string(fromByteCount:bytes, countStyle:.file))) }
         return out
     }
@@ -407,7 +407,7 @@ struct PackCompletionHero: View {
             let installed = store.installTask(after:task)
             VStack(alignment:.leading, spacing:8) {
                 Text(L("接下来两步")).font(.headline)
-                step(1, installed.map { L("已装到 iPhone") + ($0.device.map { "「\($0)」" } ?? "") + Store.packPushedClause($0.task.packFiles) }
+                step(1, installed.map { $0.task.unpackPending ?? (L("已装到 iPhone") + ($0.device.map { "「\($0)」" } ?? "") + Store.packPushedClause($0.task.packFiles)) }
                         ?? L("用数据线连上 iPhone，一键装好：用你在 Xcode 里登录的 Apple ID 签名，资源包一起拷进去")) {
                     if installed == nil {
                         HStack(spacing:10) {

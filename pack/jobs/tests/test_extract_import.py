@@ -59,7 +59,7 @@ class ExtractImportTests(JobCase):
                          (f"{tid:016X}", "Zelda NS2", "base", "dump", 0))
         self.assertEqual(pkg["path"], str(dump.resolve()))
         self.assertTrue(pkg["size"] > 0)  # 目录内文件总字节
-        self.assertEqual((self.c.library / "games" / game["id"] / "cover.jpg").read_bytes(), b"DUMP_ICON")
+        self.assertEqual((self.c.library / "games" / "Zelda NS2" / "cover.jpg").read_bytes(), b"DUMP_ICON")   # 文件夹按英文名（NACP 美式英语）
         # 没有控制分区：标题取目录名
         dump2 = self.make_dump(self.root / "RawDump", 0x0100AABBCCDD0000)
         (self.c.library / "catalog.json").write_text('{"schema": 1, "games": []}')
@@ -78,7 +78,57 @@ class ExtractImportTests(JobCase):
         self.assertEqual((game["id"], game["name"], pkg["type"], pkg["format"], pkg["display"]),
                          (f"{tid:016X}", "马力欧", "base", "extract", "2.1.0"))
         self.assertEqual(pkg["path"], str(extract.resolve()))
-        self.assertEqual((self.c.library / "games" / game["id"] / "cover.jpg").read_bytes(), b"EXTRACT_ICON")
+        # 界面名取中文、文件夹按英文名（unpack.tsv 的 name），英文名记进 catalog
+        self.assertEqual(game["englishName"], "Mario")
+        self.assertEqual((self.c.library / "games" / "Mario" / "cover.jpg").read_bytes(), b"EXTRACT_ICON")
+
+    def test_loose_folder_reaches_ns2_dump(self):
+        # 玩家 #9：已解包目录出包走 extract_folder 的 loose 分支，用到 tempfile（曾漏 import，NameError）。手算期望：起 ns2_dump.py 一次，第一个位置参数 = 临时目录，里面 base 是指向源目录的链接
+        import os
+        import tempfile as tf
+        from types import SimpleNamespace
+        from unittest import mock
+        import build
+        with tf.TemporaryDirectory() as d:
+            root = Path(d); src = root / "src"; src.mkdir(); (root / "priv").mkdir(); calls = []
+            def run(args, log, env):
+                stage = Path(args[4])
+                calls.append((Path(args[3]).name, os.path.islink(stage / "base"), os.path.realpath(stage / "base")))
+            c = SimpleNamespace(private=root / "priv", engine=root, run=run)
+            with mock.patch.object(build, "source_path", return_value=src), mock.patch.object(build, "reader_program", return_value="r"):
+                build.extract_folder(c, dict(name="G"), [dict(format="loose")], root / "x", {}, root)
+            self.assertEqual(calls, [("ns2_dump.py", True, os.path.realpath(src))])
+
+    def test_loose_link_on_windows_uses_junction_then_symlink(self):
+        # 诊断#1fad25：Windows 普通用户建符号链接 WinError 1314（没有特权），已解包散文件出包在解包一步就失败。
+        #   期望：Windows 先建目录联接；联接建不了再试符号链接（按目录建）；两样都不行报 permission_denied、说清网络盘 / 开发者模式
+        import sys as _sys
+        import types
+        from unittest import mock
+        import build
+        from core import Failure
+        calls = []
+        def junction_ok(target, link): calls.append(("junction", target, link))
+        def junction_bad(target, link): calls.append(("junction", target, link)); raise OSError(1, "不支持")
+        def symlink_ok(src, dst, target_is_directory=False): calls.append(("symlink", str(src), str(dst), target_is_directory))
+        def symlink_bad(src, dst, target_is_directory=False): calls.append(("symlink", str(src), str(dst), target_is_directory)); raise OSError(1314, "客户端没有所需的特权")
+        src, dst = "D:\\games\\loose", "C:\\stage\\base"
+        for junction, symlink, want, fails in ((junction_ok, symlink_bad, [("junction", src, dst)], False),
+                                               (junction_bad, symlink_ok, [("junction", src, dst), ("symlink", src, dst, True)], False),
+                                               (junction_bad, symlink_bad, [("junction", src, dst), ("symlink", src, dst, True)], True)):
+            calls.clear()
+            fake = types.ModuleType("pack.orch.winlong"); fake.create_junction = junction
+            with self.subTest(junction=junction.__name__, symlink=symlink.__name__), \
+                 mock.patch.dict(_sys.modules, {"pack.orch.winlong": fake}), mock.patch.object(build.os, "name", "nt"), \
+                 mock.patch.object(build.os, "symlink", symlink):
+                if fails:
+                    with self.assertRaises(Failure) as e:
+                        build._dir_link(src, dst)
+                    self.assertEqual(e.exception.code, "permission_denied")
+                    self.assertIn("开发者模式", str(e.exception))
+                else:
+                    build._dir_link(src, dst)
+                self.assertEqual(calls, want)
 
     def test_loose_import_without_keys(self):
         # 通用解包目录（有 exefs/main、exefs/main.npdm 和 romfs/ 目录，没有 unpack.tsv）：不要密钥能导入，format=loose，
@@ -91,7 +141,7 @@ class ExtractImportTests(JobCase):
         [pkg] = game["packages"]
         self.assertEqual((game["id"], game["name"], pkg["type"], pkg["format"]),
                          (f"{tid:016X}", "Splatoon", "base", "loose"))
-        self.assertEqual((self.c.library / "games" / game["id"] / "cover.jpg").read_bytes(), b"LOOSE_ICON")
+        self.assertEqual((self.c.library / "games" / "Splatoon" / "cover.jpg").read_bytes(), b"LOOSE_ICON")
 
     def test_extract_dir_in_subfolder(self):
         # 解包目录嵌在子目录里：扫描时能找到，认到就不再往里走
@@ -121,6 +171,76 @@ class ExtractImportTests(JobCase):
         result, done = self.worker("import", paths=[str(dump)])
         self.assertEqual(done["state"], "succeeded", result.stderr)
         self.assertFalse((self.c.private / "keys/status.json").exists())
+
+
+class DefaultPathUnchangedTests(JobCase):
+    """#124 逐来源结果只给开了 partialResults 的调用方：默认路径（不开）结果形状、任务记录、错误码都同 #124 之前（期望按 #124 之前的行为手写）"""
+    make_extract = ExtractImportTests.make_extract
+    def test_default_result_has_only_imports_and_record_has_no_sources(self):
+        import json
+        extract = self.make_extract(self.root / "e1", 0x01002468ACE00000, "Mario", "马力欧")
+        result, done = self.worker("import", paths=[str(extract)])
+        self.assertEqual(done["state"], "succeeded", result.stderr)
+        self.assertEqual(sorted(done["result"]), ["imports"])
+        record = json.loads((self.c.private / "logs" / "jobs" / (done["taskId"] + ".json")).read_text())
+        self.assertNotIn("sources", record)
+        result, done = self.worker("import", paths=[str(self.root / "nope" / "x.nsp")])   # 失败：结果为空，同以前
+        self.assertEqual((done["state"], done.get("result") or {}), ("failed", {}))
+
+    def test_default_catalog_write_error_keeps_original_code(self):
+        # catalog 写不进（非盘满）：默认路径照旧抛原始 OSError，explain 归 permission_denied（#124 曾统一成 job_failed）
+        import library, errors
+        from unittest.mock import patch
+        extract = self.make_extract(self.root / "e2", 0x01002468ACE00000, "Mario", "马力欧")
+        real = library.atomic
+        def atomic(path, data, *a, **k):
+            if Path(path).name == "catalog.json" and data.get("games"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path, data, *a, **k)
+        self.c.r.update(paths=[str(extract)])
+        self.c.r.pop("partialResults", None)
+        with patch.object(library, "atomic", atomic), self.assertRaises(OSError) as e:
+            library.import_games(self.c)
+        # 作业里 explain 带本作业的玩家侧路径（Context.failure_roots，启动器剃刀 H8）：catalog.json 在游戏库下 → 仍归 permission_denied
+        self.assertEqual(errors.explain(e.exception, **self.c.failure_roots()).code, "permission_denied")
+
+    def test_catalog_lock_free_while_reading_sources_held_only_for_write(self):
+        # 剃刀 H27：读原件（元数据、身份）期间目录锁空着，别的任务改名 / 换封面不报忙；只在记进 catalog、写 catalog.json 那一下持锁。
+        #   读第一款时插一个「别的任务」往 catalog 里加一款 → 导入锁里重读，两款都在（旧代码整段持锁：读的时候目录锁拿不到）
+        import filelock, json, library
+        from unittest.mock import patch
+        extract = self.make_extract(self.root / "e3", 0x01002468ACE00000, "Mario", "马力欧")
+        real, seen = library.extract_inspect, []
+        def reading(c, source, icons):
+            with filelock.held(c.library / ".catalog.lock"):   # 拿得到 = 读的时候没人持目录锁（拿不到抛 Busy，导入失败）
+                cat = json.loads((c.library / "catalog.json").read_text())
+                cat["games"].append(dict(id="0100AAAAAAAA0000", name="别的任务刚加的", packages=[]))
+                (c.library / "catalog.json").write_text(json.dumps(cat))
+                seen.append("free")
+            return real(c, source, icons)
+        written = []
+        real_atomic = library.atomic
+        def atomic(path, data, *a, **k):
+            if Path(path).name == "catalog.json":
+                written.append(filelock.read_holder(self.c.library / ".catalog.lock").get("taskId"))   # 写 catalog 时本任务持着目录锁
+            return real_atomic(path, data, *a, **k)
+        self.c.r.update(paths=[str(extract)])
+        self.c.r.pop("partialResults", None)
+        with patch.object(library, "extract_inspect", reading), patch.object(library, "atomic", atomic):
+            library.import_games(self.c)
+        self.assertEqual((seen, written), (["free"], [self.c.task]))
+        ids = sorted(g["id"] for g in json.loads((self.c.library / "catalog.json").read_text())["games"])
+        self.assertEqual(ids, sorted(["0100AAAAAAAA0000", "01002468ACE00000"]))
+
+    def test_record_sources_caps_each_and_total(self):
+        import core
+        big = "头" + "x" * 50_000 + "尾"
+        rows = core.record_sources([dict(status="failed", code="content_invalid", reason="r", diagnostic=big) for _ in range(30)])
+        self.assertTrue(all(len(r["diagnostic"]) <= core.IMPORT_RECORD_SOURCE_DIAGNOSTIC for r in rows))
+        self.assertTrue(rows[0]["diagnostic"].startswith("头") and rows[0]["diagnostic"].endswith("尾"))
+        self.assertLessEqual(sum(len(r["diagnostic"]) for r in rows), core.IMPORT_RECORD_DIAGNOSTICS_TOTAL)
+        self.assertEqual(rows[-1]["diagnostic"], "")                       # 超出总量的来源只留 code / reason / status
+        self.assertEqual((rows[-1]["code"], rows[-1]["status"]), ("content_invalid", "failed"))
 
 
 if __name__ == "__main__":

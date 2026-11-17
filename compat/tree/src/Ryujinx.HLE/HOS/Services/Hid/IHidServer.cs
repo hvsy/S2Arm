@@ -1,6 +1,7 @@
 using Ryujinx.Common;
 using Ryujinx.Common.Logging;
 using Ryujinx.HLE.HOS.Ipc;
+using Ryujinx.HLE.HOS.Kernel.Memory;
 using Ryujinx.HLE.HOS.Kernel.Threading;
 using Ryujinx.HLE.HOS.Services.Hid.HidServer;
 using Ryujinx.HLE.HOS.Services.Hid.Types;
@@ -773,6 +774,7 @@ namespace Ryujinx.HLE.HOS.Services.Hid
 
             context.Device.Hid.Npads.SupportedStyleSets = type;
             Ryujinx.Common.S2AInputCaps.RecordStyleSet((uint)type);  // S2Arm: 收局 [输入能力] 摘要
+            NpadDevices.S2ASupportedChanged?.Invoke(context.Device);  // S2Arm：虚拟手柄在声明这一刻跟随（NpadDevices）
 
             return ResultCode.Success;
         }
@@ -816,6 +818,7 @@ namespace Ryujinx.HLE.HOS.Services.Hid
             }
 
             Logger.Stub?.PrintStub(LogClass.ServiceHid, $"{supportedPlayerIds.Length} Players: " + string.Join(",", supportedPlayerIds.ToArray()));
+            NpadDevices.S2ASupportedChanged?.Invoke(context.Device);  // S2Arm：虚拟手柄在声明这一刻跟随（NpadDevices）
 
             return ResultCode.Success;
         }
@@ -1352,6 +1355,13 @@ namespace Ryujinx.HLE.HOS.Services.Hid
             long appletResourceUserId = context.RequestData.ReadInt64();
 #pragma warning restore IDE0059
 
+            return SendVibrationValuesFromBuffers(context);
+        }
+
+        // S2Arm: the two pointer buffers of SendVibrationValues (206): device handles and vibration values. Switch 2's 214 sends the same two buffers
+        private static ResultCode SendVibrationValuesFromBuffers(ServiceCtx context)
+        {
+
             // S2Arm: zero allocation (10-22 mhrise: ~170 calls per second, 320 B each = the game threads' largest steady allocation):
             // the two small arrays are read onto the stack, and each group (same player, at most two positions) is kept in locals
             // instead of a dictionary per group. Same grouping and the same values reach the rumble queue as before.
@@ -1611,6 +1621,49 @@ namespace Ryujinx.HLE.HOS.Services.Hid
             long appletResourceUserId = context.RequestData.ReadInt64();
 
             Logger.Stub?.PrintStub(LogClass.ServiceHid, new { appletResourceUserId });
+
+            return ResultCode.Success;
+        }
+
+        [CommandCmif(320)] // 21.0.0+
+        // EnableNpadImu(pid, nn::applet::AppletResourceUserId, u64 TransferMemorySize, TransferMemoryHandle)：S2Arm——形状读自 Switch 2 SDK 的
+        //   nn::hid::EnableNpadImu(void*, size_t)（建传输内存、交出句柄与大小）；缓冲格式与写入见 HidDevices/NpadImu.cs
+        public ResultCode EnableNpadImu(ServiceCtx context)
+        {
+            long appletResourceUserId = context.RequestData.ReadInt64();
+            ulong size = context.RequestData.ReadUInt64();
+            int handle = context.Request.HandleDesc.ToCopy[0];
+
+            KTransferMemory transferMemory = context.Process.HandleTable.GetObject<KTransferMemory>(handle);
+
+            if (transferMemory == null)
+            {
+                S2AHooks.Red?.Invoke($"hid EnableNpadImu：句柄 0x{handle:X} 不是传输内存");
+
+                return ResultCode.InvalidBufferSize;
+            }
+
+            if (size != transferMemory.Size || size < NpadImu.MinimumSize)
+            {
+                S2AHooks.Red?.Invoke($"hid EnableNpadImu：缓冲大小 0x{size:X}（传输内存 0x{transferMemory.Size:X}）与 SDK 布局要的 0x{NpadImu.MinimumSize:X} 不符");
+
+                return ResultCode.InvalidBufferSize;
+            }
+
+            context.Device.Hid.Npads.Imu.Enable(context.Memory, transferMemory.Address, appletResourceUserId);
+
+            Logger.Info?.Print(LogClass.ServiceHid, $"EnableNpadImu: aruid {appletResourceUserId}, buffer 0x{transferMemory.Address:X}+0x{size:X}");
+
+            return ResultCode.Success;
+        }
+
+        [CommandCmif(321)] // 21.0.0+
+        // DisableNpadImu(pid, nn::applet::AppletResourceUserId)
+        public ResultCode DisableNpadImu(ServiceCtx context)
+        {
+            long appletResourceUserId = context.RequestData.ReadInt64();
+
+            context.Device.Hid.Npads.Imu.Disable(appletResourceUserId);
 
             return ResultCode.Success;
         }
@@ -1959,7 +2012,7 @@ namespace Ryujinx.HLE.HOS.Services.Hid
 
         // ---------- S2Arm：Switch 2 SDK 的 hid 新命令（Pokopia 首帧后起用；HD 振动 2、Joy-Con 2 鼠标 / Jcms 传感器、原生输入）----------
         // 宿主没有这些设备：输入一律收下（不改任何状态）、回成功；有输出的回「没有 / 0」——220 旗标 false、1003 不需要更新固件、3133 状态 0。
-        //   命令号与输出形状来自 Eden-NS2 hid_server.cpp（GPL，只借事实，代码自写）；手柄 / 振动的真实现仍走原有命令
+        //   命令号与输出形状来自 Eden-NS2 hid_server.cpp（GPL，只借事实，代码自写）；手柄的真实现仍走原有命令；214 震动见下
 
         [CommandCmif(89)]
         public ResultCode ResetIsSixAxisSensorDeviceNewlyAssigned(ServiceCtx context) => ResultCode.Success;
@@ -1980,7 +2033,13 @@ namespace Ryujinx.HLE.HOS.Services.Hid
         public ResultCode SendNativeVibrationValue213(ServiceCtx context) => ResultCode.Success;
 
         [CommandCmif(214)]
-        public ResultCode SendNativeVibrationValues(ServiceCtx context) => ResultCode.Success;
+        // S2Arm: Switch 2 游戏的震动走这条（11-10 程序号 0400486024DEC000 每帧一次；请求数据区 24 字节 = 2、资源号、0，指针缓冲 0 = 设备句柄、1 = 震动值，
+        //   与 206 SendVibrationValues 同形）：按 206 同一条路入震动队列。不带两个缓冲的照旧只回成功
+        public ResultCode SendNativeVibrationValues(ServiceCtx context)
+        {
+            if (context.Request.PtrBuff.Count < 2) return ResultCode.Success;
+            return SendVibrationValuesFromBuffers(context);
+        }
 
         [CommandCmif(220)]
         public ResultCode GetNativeInputFlag220(ServiceCtx context) { context.ResponseData.Write(false); return ResultCode.Success; }
@@ -1989,16 +2048,71 @@ namespace Ryujinx.HLE.HOS.Services.Hid
         public ResultCode IsFirmwareUpdateNeededForNotification(ServiceCtx context) { context.ResponseData.Write(false); return ResultCode.Success; }
 
         [CommandCmif(3110)]
-        public ResultCode RegisterJcmsMemory(ServiceCtx context) => ResultCode.Success;
+        // InitializeJcms(pid, nn::applet::AppletResourceUserId, u64 TransferMemorySize, TransferMemoryHandle)：S2Arm——形状读自随游戏 SDK 的
+        //   nn::hid::InitializeJcms(void*, size_t)（同 320：建传输内存、交出句柄与大小）；缓冲格式与写入见 HidDevices/NpadJcms.cs。
+        //   原先是空桩：回成功但不写，游戏读到全 0，认为连着的手柄不是 Joy-Con 2
+        public ResultCode InitializeJcms(ServiceCtx context)
+        {
+            long appletResourceUserId = context.RequestData.ReadInt64();
+            ulong size = context.RequestData.ReadUInt64();
+            int handle = context.Request.HandleDesc.ToCopy[0];
+
+            KTransferMemory transferMemory = context.Process.HandleTable.GetObject<KTransferMemory>(handle);
+
+            if (transferMemory == null)
+            {
+                S2AHooks.Red?.Invoke($"hid InitializeJcms：句柄 0x{handle:X} 不是传输内存，Joy-Con 2 鼠标传感器不可用");
+
+                return ResultCode.Success;
+            }
+
+            if (size > transferMemory.Size || transferMemory.Size < NpadJcms.MinimumSize)
+            {
+                S2AHooks.Red?.Invoke($"hid InitializeJcms：缓冲大小 0x{size:X}（传输内存 0x{transferMemory.Size:X}）小于 SDK 布局要的 0x{NpadJcms.MinimumSize:X}，Joy-Con 2 鼠标传感器不可用");
+
+                return ResultCode.Success;
+            }
+
+            context.Device.Hid.Npads.Jcms.Register(context.Memory, transferMemory.Address);
+
+            Logger.Info?.Print(LogClass.ServiceHid, $"InitializeJcms: aruid {appletResourceUserId}, buffer 0x{transferMemory.Address:X}+0x{size:X}");
+
+            return ResultCode.Success;
+        }
 
         [CommandCmif(3111)]
-        public ResultCode NativeInputCommand3111(ServiceCtx context) => ResultCode.Success;
+        // FinalizeJcms(pid, nn::applet::AppletResourceUserId)
+        public ResultCode FinalizeJcms(ServiceCtx context)
+        {
+            context.Device.Hid.Npads.Jcms.Unregister();
+
+            return ResultCode.Success;
+        }
 
         [CommandCmif(3112)]
-        public ResultCode SetNativeInputFlags3112(ServiceCtx context) => ResultCode.Success;
+        // StartJcms(nn::hid::JcmsHandle)：hid 一直按手柄读数写缓冲，这里只记开关（日志用）
+        public ResultCode StartJcms(ServiceCtx context)
+        {
+            uint jcmsHandle = context.RequestData.ReadUInt32();
+
+            if (!context.Device.Hid.Npads.Jcms.Started)
+            {
+                Logger.Info?.Print(LogClass.ServiceHid, $"StartJcms: npad {jcmsHandle & 0xff} type {(jcmsHandle >> 8) & 0xff}");
+            }
+
+            context.Device.Hid.Npads.Jcms.Started = true;
+
+            return ResultCode.Success;
+        }
 
         [CommandCmif(3113)]
-        public ResultCode SetNativeInputFlags3113(ServiceCtx context) => ResultCode.Success;
+        // StopJcms(nn::hid::JcmsHandle)
+        public ResultCode StopJcms(ServiceCtx context)
+        {
+            context.Device.Hid.Npads.Jcms.Started = false;
+
+            return ResultCode.Success;
+        }
 
         [CommandCmif(3131)]
         public ResultCode NativeInputCommand3131(ServiceCtx context) => ResultCode.Success;

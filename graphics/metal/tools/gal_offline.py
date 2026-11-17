@@ -4,13 +4,14 @@
 # 步骤：① gal_xc：每支 SPIR-V → <键>.metal + gal.idx（与运行时现编同一份翻译代码）；② 并行 xcrun metal -c → .air；③ 按键序分片，每片 xcrun metallib → gal.<片号>.metallib。
 # 产物：<输出目录>/gal.<片号>.metallib、gal.shards（每行「首键 16 位十六进制<TAB>文件名」，按键升序）、gal.idx（运行时 nxgal_prog_lib_open(目录)）；中间 .metal / .air 留在 <输出目录>/msl 供排查。
 # 分片（10-20）：整库一块要几百 MB 连续地址，iPhone 低区空洞被 C# 初始化与线程栈打碎（巫师3 365 MB 开不了）；每片 ≤64 MB（切片目标 GAL_SHARD_MB）。
+import os as _pw_os, sys as _pw_sys; _pw_sys.path.append(_pw_os.path.join(_pw_os.path.dirname(_pw_os.path.abspath(__file__)), '..', '..', '..', 'tools')); from pool_workers import env_jobs  # noqa: E402  核数 / 进程池路数唯一来源（tools/pool_workers.py，#1332）
 import bisect, os, re, subprocess, sys, threading, concurrent.futures as cf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '../../..'))
 src, out, plat = sys.argv[1], sys.argv[2], sys.argv[3]
 sdk = {'ios': 'iphoneos', 'macos': 'macosx'}[plat]
-J = max(1, int(os.environ.get('J', str(os.cpu_count() or 8))))
+J = env_jobs('J')
 xc = os.environ.get('GAL_XC', os.path.join(ROOT, 'build/gal/gal_xc'))
 os.makedirs(out, exist_ok=True)
 if os.environ.get('GAL_XC_DONE') == '1' and os.path.exists(os.path.join(out, 'gal.idx')):   # ① 已由调用方跑过（graphics/tools/shbake 出包时为拼宿主程序二进制先跑了 gal_xc）：不重翻
@@ -247,4 +248,6 @@ with open(os.path.join(out, 'gal.shards'), 'w') as fh:
 print(f'gal_offline：MSL {len(mets)} 支（缓存命中 {hits[0]}，现编 {len(mets) - hits[0]}），metal 编译失败 {len(bad)}，入库 {len(airs)} → {len(shards)} 片，最大 {max((b for _, b in big), default=0) / 1048576:.1f} MB；'
       f'链接内存预算 {budget / (1 << 30):.1f} GB（每片峰值估 ≤{max(est, default=0) / (1 << 30):.1f} GB），最多同时 {peak_par[0]} 片')
 if any(b > MB for _, b in big): sys.exit(f'【红】分片超上限 {MB >> 20} MB：' + ', '.join(f'第 {i} 片 {b / 1048576:.1f} MB' for i, b in big if b > MB))
-if bad: print(f'【红】metal 编译失败首例：{bad[0][0]}：{bad[0][1].strip()[:300]}')
+# 有支编不过 = 库缺支：走红通道非 0 退出（审计 P2-208：原先只打一行红照退 0，tests/visual/widen_gate.sh 只看退出码会把缺支的库装上）。
+#   metal_failed.txt 照写（shader_pack.sh 的红计数、pso_gen.py 跳过缺的函数都读它）
+if bad: sys.exit(f'【红】metal 编译失败 {len(bad)} 支，首例：{bad[0][0]}：{bad[0][1].strip()[:300]}')

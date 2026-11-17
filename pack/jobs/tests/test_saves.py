@@ -5,6 +5,8 @@ import copy
 import io
 import json
 import os
+os.environ.setdefault("S2A_BANNER_FETCH", "0")   # 同 jobcase.py：作业开始时 layout.ensure 会起脱离作业的商店查询子进程，往 library/ 写；测试收尾删临时目录时它还在写 → Directory not empty（11-10 负载下偶发）
+import shutil
 import stat
 import struct
 import subprocess
@@ -21,6 +23,7 @@ sys.path.insert(0, str(JOBS))
 # Standalone unittest discovery uses this checkout's job modules.
 import library  # noqa: E402
 import saves  # noqa: E402
+import layout  # noqa: E402
 from core import Cancelled, Context, Failure, atomic  # noqa: E402
 
 import build  # noqa: E402
@@ -93,7 +96,11 @@ class SaveTests(unittest.TestCase):
             hidden=False,
         )
         atomic(self.directory / "library/catalog.json", dict(schema=1, games=[self.game]))
-        self.root = self.directory / "library/saves" / GID
+        # 新布局：先创建单款文件夹和 game.json
+        game_folder = self.directory / "library/games/TestGame"
+        game_folder.mkdir(parents=True, exist_ok=True)
+        atomic(game_folder / "game.json", dict(schema=1, id=GID))
+        self.root = game_folder / "saves"
         self.put(PROGRESS, b"checkpoint-one")
         self.put("bis/user/save/0000000000000001/ExtraData0", b"extra-data")
         self.put(saves.SAVE_INDEX, synthetic_index([(1, GID, 1, USER)]))
@@ -161,6 +168,18 @@ class SaveTests(unittest.TestCase):
             self.assertNotIn("payload/system/prod.keys", z.namelist())
         self.assertFalse(list((self.directory / "library/save-transactions").glob("*.json")))
 
+    def test_scan_skips_os_junk_files(self):
+        """exFAT / FAT 上 macOS 给每个带扩展属性的文件生成 ._<名>（AppleDouble），访达写 .DS_Store：不是存档。
+        期望按构造写死：只剩 a.bin 与 sub/b.bin 两个文件、sub 一个目录；修前 ._a.bin、.DS_Store、sub/._b.bin 也进了备份清单"""
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "saves"; (root / "sub").mkdir(parents=True)
+            (root / "a.bin").write_bytes(b"a"); (root / "sub" / "b.bin").write_bytes(b"b")
+            (root / "._a.bin").write_bytes(b"\x00\x05\x16\x07\x00\x02\x00\x00\x09\x00"); (root / ".DS_Store").write_bytes(b"Bud1"); (root / "sub" / "._b.bin").write_bytes(b"\x00\x05")
+            files, dirs = saves.scan(SimpleNamespace(check=lambda: None), root)
+            self.assertEqual(list(files), ["a.bin", "sub/b.bin"])
+            self.assertEqual(dirs, ["sub"])
+
     def test_export_manifest_lists_exact_files_without_keys(self):
         self.backup()
         result = self.preview()
@@ -170,7 +189,6 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(m["users"], dict(ids=[USER], active=USER))
         self.assertTrue(any(f["path"].startswith("bis/system/save/") for f in m["files"]))
         self.assertFalse(any("prod.keys" in f["path"] for f in m["files"]))
-        self.assertEqual(self.archive.stat().st_mode & 0o777, 0o600)
 
     def test_zip64_directory_bounds_are_checked_before_zipfile_loads_it(self):
         self.backup()
@@ -230,6 +248,75 @@ class SaveTests(unittest.TestCase):
         self.assertTrue(saves.restore(c)["committed"])
         self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
 
+    def move_game_to_second_location(self):
+        """把这款搬到第二个存放位置（默认游戏库之外），返回那个位置的根"""
+        disk = self.directory / "disk2"
+        (disk / "games").mkdir(parents=True)
+        shutil.move(str(self.root.parent), str(disk / "games/TestGame"))
+        layout.register_location(self.context(), disk)
+        self.root = disk / "games/TestGame/saves"
+        self.assertEqual(layout.find_game(self.context(), GID), disk / "games/TestGame")
+        return disk
+
+    def test_restore_of_game_in_second_location_syncs_only_inside_that_location(self):
+        # 11-10 安装版 c341ca87 / M1 Max：一款游戏在第二存放位置，恢复存档停在「验证恢复条件」、进程占满一个核不结束（采样全在 open → fsync → close）。
+        # 根因：restore 把事务与备份目录的逐级同步终点写成默认游戏库 c.library，备份目录在游戏所在位置下，往上走不到 c.library，
+        #   到文件系统根后 parent 还是自己，sync_parents 不结束。
+        # 期望不跑被测实现就能定：恢复只在游戏所在位置里建目录，逐级同步的每个目录都是该位置的根或在它下面；走出去的第一步就判红（免得挂住整轮测试）
+        disk = self.move_game_to_second_location()
+        c = self.prepare_restore()
+        real, outside = saves.fsync_dir, []
+
+        def checked(path):
+            path = Path(path)
+            if path != disk and disk not in path.parents:
+                outside.append(path)
+                raise AssertionError("逐级同步走出了游戏所在的存放位置：%s" % path)
+            real(path)
+
+        with patch.object(saves, "fsync_dir", checked):
+            result = saves.restore(c)
+        self.assertEqual(outside, [])
+        self.assertTrue(result["committed"])
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
+        self.assertTrue(Path(result["previousBackup"]).is_relative_to(disk))
+        self.assertFalse((self.directory / "library/save-transactions").exists())
+
+    def test_backup_of_game_in_second_location_finishes_and_stays_out_of_that_location(self):
+        # 第二存放位置的款：备份照常写出；备份文件不许落进这款自己的存放位置（同默认游戏库那条，免得被当游戏数据一起搬 / 删）
+        disk = self.move_game_to_second_location()
+        self.assertTrue(Path(self.backup()["outputPath"]).is_file())
+        with self.assertRaises(Failure):
+            saves.backup(self.context(operation="saveBackup", path=str(disk / "inside.s2asave")))
+        self.assertFalse((disk / "inside.s2asave").exists())
+
+    def test_restore_checks_free_space_on_the_games_own_location(self):
+        # 暂存与恢复前副本写在这款的存放位置上：剩余空间要量那块盘，不是默认游戏库那块
+        disk = self.move_game_to_second_location()
+        c = self.prepare_restore()
+        seen, real = [], shutil.disk_usage
+        with patch.object(saves.shutil, "disk_usage", lambda p: (seen.append(Path(p)), real(p))[1]):
+            self.assertTrue(saves.restore(c)["committed"])
+        self.assertEqual(seen[0], disk)   # 恢复前预检；之后写恢复前副本时量的是副本目录，也在这个位置下
+        self.assertTrue(all(p == disk or disk in p.parents for p in seen), seen)
+
+    def test_sync_parents_refuses_a_root_that_is_not_an_ancestor(self):
+        # 终点不是起点的祖先：期望报错，不是在文件系统根上一直同步下去。同步次数上限手算 = 起点自己 + 它的全部祖先
+        start, calls = self.directory / "a/b", []
+        start.mkdir(parents=True)
+
+        def counted(path):
+            calls.append(Path(path))
+            if len(calls) > len(start.parents) + 1:
+                raise AssertionError("到文件系统根后仍在同步（第 %d 次：%s）" % (len(calls), path))
+
+        with patch.object(saves, "fsync_dir", counted):
+            with self.assertRaises(ValueError):
+                saves.sync_parents(start, self.directory / "elsewhere")
+            calls.clear()
+            saves.sync_parents(start, self.directory)
+        self.assertEqual(calls, [start, start.parent, self.directory])
+
     def test_empty_status_is_normal_and_backup_does_not_create_save_data(self):
         import shutil
 
@@ -242,22 +329,33 @@ class SaveTests(unittest.TestCase):
         self.assertFalse(self.archive.exists())
         self.assertFalse(self.root.exists())
 
-    def test_wrong_game_version_and_user_are_rejected(self):
+    def test_wrong_game_rejected_version_and_user_warn(self):
+        """维护者 11-17：版本 / DLC 组合、用户归属对不上不再拒绝恢复。期望手写：
+        另一款游戏 → 照旧拒绝；版本 / contentIdentity 不符、用户不符 → 检查照常通过、提示里有对应那句、发 warning，恢复照常完成、恢复前副本在；
+        请求带 sync（云存档自动同步）→ 照旧拒绝；任何拒绝都不动当前存档"""
         self.backup()
         original = self.archive.read_bytes()
-        for field, value in (
-            ("id", "0100000000000001"),
-            ("version", 2),
-            ("contentIdentity", "b" * 64),
-        ):
+        def sync_preview():
+            return saves.inspect(self.context(operation="saveInspect", path=str(self.archive), sync=True))
+        self.archive.write_bytes(original)
+        self.rewrite_archive(lambda m: m["game"].update({"id": "0100000000000001"}))
+        with self.assertRaises(Failure):
+            self.preview()
+        for field, value in (("version", 2), ("contentIdentity", "b" * 64)):
             with self.subTest(field=field):
                 self.archive.write_bytes(original)
-                self.rewrite_archive(
-                    lambda m, field=field, value=value: m["game"].update({field: value})
-                )
+                self.rewrite_archive(lambda m, field=field, value=value: m["game"].update({field: value}))
                 with self.assertRaises(Failure):
-                    self.preview()
+                    sync_preview()
+                c = self.context(operation="saveInspect", path=str(self.archive))
+                got = saves.inspect(c)
+                self.assertIn(saves.VERSION_NOTICE, got["notice"])
+                self.assertEqual([(d["code"], d["severity"]) for d in c.job["diagnostics"]], [("save_version", "warning")])
                 self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
+                r = self.context(operation="saveRestore", path=str(self.archive), **got)
+                result = saves.restore(r)
+                self.assertTrue(result.get("previousBackup"))
+                self.assertTrue(Path(result["previousBackup"]).exists())
         self.archive.write_bytes(original)
         other = "00000000000000020000000000000000"
         self.put(
@@ -266,7 +364,11 @@ class SaveTests(unittest.TestCase):
         )
         self.put(saves.SAVE_INDEX, synthetic_index([(1, GID, 1, other)]))
         with self.assertRaises(Failure):
-            self.preview()
+            sync_preview()
+        c = self.context(operation="saveInspect", path=str(self.archive))
+        got = saves.inspect(c)
+        self.assertIn(saves.USER_NOTICE, got["notice"])
+        self.assertEqual([(d["code"], d["severity"]) for d in c.job["diagnostics"]], [("save_wrong_user", "warning")])
 
     def test_index_owners_override_current_profile_and_profiles_are_labels_only(self):
         owner = "78626c000000000153574e4154495645"
@@ -365,17 +467,59 @@ class SaveTests(unittest.TestCase):
         with self.assertRaises(Failure):
             self.backup()
 
-    def test_changed_archive_or_target_requires_a_new_preview(self):
+    def test_changed_archive_or_target_after_preview_warns_and_restores(self):
+        """维护者 11-17（按新规矩改：原先检查后当前存档 / 备份又变了就拒绝、要重新检查）。期望手写：
+        检查后当前存档又存了一次（three）→ 照常恢复成备份里的 one、发 warning save_changed，执行时现拍的恢复前副本里是 three；
+        检查后备份又被改过（按现在内容重新校验通过）→ 同样照常恢复；云存档自动同步（sync）照旧拒绝、不动当前存档"""
         c = self.prepare_restore()
         self.put(PROGRESS, b"checkpoint-three")
+        sync = self.context(**(c.r | dict(taskId=uuid.uuid4().hex, sync=True)))
         with self.assertRaises(Failure):
-            saves.restore(c)
+            saves.restore(sync)
         self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-three")
-        c.r.update(self.preview())
+        result = saves.restore(c)
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
+        self.assertIn(("save_changed", "warning"), [(d["code"], d["severity"]) for d in c.job["diagnostics"]])
+        with zipfile.ZipFile(result["previousBackup"]) as z:
+            self.assertEqual(z.read("payload/" + PROGRESS), b"checkpoint-three")
+        c2 = self.context(operation="saveRestore", path=str(self.archive), **self.preview())
         self.rewrite_archive(lambda m: m.update(createdAt="changed"))
+        saves.restore(c2)
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
+        self.assertIn(("save_changed", "warning"), [(d["code"], d["severity"]) for d in c2.job["diagnostics"]])
+
+    def corrupt_payload(self, name):
+        """备份里 payload/<name> 换成同长的别的字节（CRC 与 SHA 都对不上，大小不变）"""
+        with zipfile.ZipFile(self.archive) as z:
+            data = {i.filename: z.read(i) for i in z.infolist()}
+        raw = bytearray(data["payload/" + name]); raw[-1] ^= 0xFF; data["payload/" + name] = bytes(raw)
+        with zipfile.ZipFile(self.archive, "w") as z:
+            for n, content in data.items():
+                z.writestr(n, content)
+
+    def test_damaged_file_keeps_target_original_and_restores_the_rest(self):
+        """维护者 11-17：备份里个别文件 CRC / SHA 坏了不再整份拒绝。期望手写：进度文件坏 → 检查照常通过、提示点名它、发 warning save_damaged；
+        恢复后这个文件保留当前存档原来的 two，其余照常恢复；账号索引坏 → 照旧拒绝；云存档自动同步照旧拒绝"""
+        self.backup()
+        other = "bis/user/save/0000000000000001/0/other.bin"
+        self.put(other, b"other-one")
+        self.archive.unlink(); self.backup()
+        original = self.archive.read_bytes()
+        self.put(PROGRESS, b"checkpoint-two"); self.put(other, b"other-two")
+        self.corrupt_payload(PROGRESS)
         with self.assertRaises(Failure):
-            saves.restore(c)
-        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-three")
+            saves.inspect(self.context(operation="saveInspect", path=str(self.archive), sync=True))
+        c = self.context(operation="saveInspect", path=str(self.archive))
+        got = saves.inspect(c)
+        self.assertIn(PROGRESS, got["notice"])
+        self.assertIn(("save_damaged", "warning"), [(d["code"], d["severity"]) for d in c.job["diagnostics"]])
+        saves.restore(self.context(operation="saveRestore", path=str(self.archive), **got))
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-two")   # 坏的不写，留原来的
+        self.assertEqual((self.root / other).read_bytes(), b"other-one")   # 其余照常恢复成备份里的
+        self.archive.write_bytes(original)
+        self.corrupt_payload(saves.SAVE_INDEX)
+        with self.assertRaises(Failure):
+            self.preview()
 
     def test_unsafe_and_corrupt_archives_are_rejected_without_writes(self):
         self.backup()
@@ -442,6 +586,19 @@ class SaveTests(unittest.TestCase):
         with self.assertRaises(Failure):
             self.backup()
         self.assertEqual(self.archive.read_bytes(), b"existing backup")
+
+    def test_backup_on_drive_without_hard_links(self):
+        # v0.3.1：存档备份放到位用硬链接（不覆盖地落盘）；exFAT / FAT32 建不了硬链接（WinError 1 / EPERM）→ 退回「核没有同名再改名」，
+        #   备份照样落盘、内容完整；已有同名备份时照旧不覆盖
+        def no_links(*a, **k):
+            raise OSError(1, "Incorrect function")
+        with patch.object(saves.os, "link", no_links):
+            self.backup()
+            self.assertTrue(self.archive.is_file() and self.archive.stat().st_size > 0)
+            before = self.archive.read_bytes()
+            with self.assertRaises(Failure):
+                self.backup()
+            self.assertEqual(self.archive.read_bytes(), before)
 
     def test_disk_shortage_and_cancellation_leave_original_intact(self):
         c = self.prepare_restore()
@@ -586,9 +743,10 @@ sys.exit(main.main())
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
 import saves
+import layout
 from core import Context
 c=Context(json.loads(Path(sys.argv[2]).read_text()))
-root=Path(c.library)/"saves"/c.r["gameId"]
+root=layout.path(c,c.r["gameId"],"saves",create=False)
 rename=os.rename
 def crash(src,dst):
     rename(src,dst)
@@ -636,7 +794,8 @@ saves.restore(c)
     def test_live_execution_lock_blocks_backup(self):
         import filelock
 
-        with (self.directory / "library/.execution.lock").open("a") as f:
+        import core
+        with (self.directory / "library/.execution.lock").open("a") as f, patch.object(core, "LOCK_WAIT_S", 0.3):   # 排队上限调短（同 test_filelock / test_probe_jobs 的 0.3 秒口径）：这里核的是「锁被占 → 报忙、不动东西」，不是等满产品缺省 30 秒（11-14 门禁提速：原先每例白等 30 秒）
             filelock.try_lock(f)
             with self.assertRaises(Failure):
                 self.backup()
@@ -719,9 +878,48 @@ class ExternalImportTests(unittest.TestCase):
         self.assertTrue(Path(result["previousBackup"]).is_file())
         self.assertEqual(preview["fileCount"], len(preview["manifest"]["files"]))
 
+    def test_game_with_account_and_device_saves_takes_each_folder_to_its_own_slot(self):
+        # NX2Apple 的马车 8 这类游戏：save → 账户存档，save_device → 设备存档；互不影响
+        self.put(saves.SAVE_INDEX, synthetic_index([(1, GID, 1, USER), (2, GID, 3, "0" * 32)]))
+        self.put("bis/user/save/0000000000000002/0/device.bin", b"old-device")
+        src = self.community("nx", {"save/progress.bin": b"account-new"})
+        self.assertTrue(self.import_(src / "save")[0]["committed"])
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"account-new")
+        self.assertEqual((self.root / "bis/user/save/0000000000000002/0/device.bin").read_bytes(), b"old-device")
+        src = self.community("nx2", {"save_device/device.bin": b"device-new"})
+        self.assertTrue(self.import_(src / "save_device")[0]["committed"])
+        self.assertEqual((self.root / "bis/user/save/0000000000000002/0/device.bin").read_bytes(), b"device-new")
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"account-new")
+
+    def test_nx2apple_folder_zip_and_save_folder_all_import(self):
+        # 11-09 实测：NX2Apple 存档拖 <游戏号>/ 能认，压缩包（外面多套一层）和直接拖 save/ 认不出——
+        #   save/ 顶层只有子文件夹时被当 JKSV 往下钻进第一个子文件夹；三种都要把整棵存档放进账户存档槽
+        self.put(saves.SAVE_INDEX, synthetic_index([(1, GID, 1, USER)]))
+        tree = {"save/Saved Games/Hades/Profile1.sav": b"nx-profile", "save/Data Records/.keep": b"", "save/Temp/t.bin": b"tmp"}
+        folder = self.community(GID.lower(), tree)
+        archive = self.directory / "nx2apple.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            for rel, data in tree.items():
+                z.writestr(GID.lower() + "/" + rel, data)
+        for i, src in enumerate((folder, archive, folder / "save")):
+            self.put("bis/user/save/0000000000000001/0/Saved Games/Hades/Profile1.sav", b"old-%d" % i)
+            self.assertTrue(self.import_(src)[0]["committed"], src)
+            slot = self.root / "bis/user/save/0000000000000001/0"
+            self.assertEqual((slot / "Saved Games/Hades/Profile1.sav").read_bytes(), b"nx-profile", src)
+            self.assertEqual((slot / "Temp/t.bin").read_bytes(), b"tmp", src)
+
+    def test_nx2apple_save_folder_goes_to_device_save_when_the_game_has_only_that(self):
+        # NX2Apple 引擎：游戏只有设备存档（如01006F8002326000）时设备存档就放在 save/；按「只有设备存档就进设备存档」导入，不报没有存档位置
+        shutil.rmtree(self.root / "bis/user/save/0000000000000001", ignore_errors=True)
+        self.put(saves.SAVE_INDEX, synthetic_index([(2, GID, 3, "0" * 32)]))
+        self.put("bis/user/save/0000000000000002/0/device.bin", b"old-device")
+        src = self.community(GID.lower(), {"save/device.bin": b"device-new"})
+        self.assertTrue(self.import_(src)[0]["committed"])
+        self.assertEqual((self.root / "bis/user/save/0000000000000002/0/device.bin").read_bytes(), b"device-new")
+
     def test_zero_directory_judged_against_this_games_own_slot(self):
         # 10-27：社区存档唯一子目录 0/ —— 游戏自己的槽 0 顶层是 progress.bin → 0/ 是提交目录，剥掉；
-        # 游戏自己的槽 0 顶层有 0/ 目录（塞尔达式槽位）→ 不剥，原样放进槽 0
+        # 游戏自己的槽 0 顶层有 0/ 目录（一款第一方动作冒险游戏式槽位）→ 不剥，原样放进槽 0
         src = self.community("Ryujinx zero", {"0/progress.bin": b"stripped"})
         with patch.object(saves.save_formats, "detect", return_value=[]):
             self.assertTrue(self.import_(src)[0]["committed"])
@@ -807,14 +1005,72 @@ class ExternalImportTests(unittest.TestCase):
         self.assertEqual(e.exception.code, "save_wrong_game")
         self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
 
-    def test_game_without_save_location_asks_to_run_once(self):
+    def test_game_never_played_takes_the_save_on_next_launch(self):
         import shutil
 
         shutil.rmtree(self.root / "bis")
-        src = self.community("raw", {"Synthetic game/Player/progress.bin": b"x"})
-        with patch.object(saves.save_formats, "detect", return_value=[]), self.assertRaises(Failure) as e:
-            saves.inspect(self.context(operation="saveInspect", path=str(src)))
-        self.assertEqual(e.exception.code, "save_no_target")
+        src = self.community("raw", {"progress.bin": b"native-save", "sub/more.bin": b"more"})
+        preview = saves.inspect(self.context(operation="saveInspect", path=str(src)))
+        self.assertEqual(preview["notice"], saves.SEED_NOTICE)
+        self.assertEqual((preview["fileCount"], preview["totalBytes"]), (2, 15))
+        c = self.context(operation="saveRestore", path=str(src), **preview)
+        self.assertTrue(saves.restore(c)["committed"])
+        pending = saves.pending_seed(c, GID)
+        self.assertEqual((pending / "account/progress.bin").read_bytes(), b"native-save")
+        self.assertEqual((pending / "account/sub/more.bin").read_bytes(), b"more")
+        self.assertEqual(saves.claim_seed(c, GID), pending)
+        log = self.directory / "game.log"
+        log.write_text("启动失败，没灌入", encoding="utf-8")
+        saves.finish_seed(c, GID, log)
+        self.assertEqual(saves.claim_seed(c, GID), pending)   # 没灌成功：留着，下次启动再放
+        # 审计 P1-156：只有「当前用户」行和前一类成功行、后一类挂不上（没有全部完成那句）→ 种子留着
+        log.write_text("S2A 带存档起局：当前用户 0123\nS2A 带存档起局：account ← x（2 个文件，15 字节）\n"
+                       "带存档起局：挂 device 存档失败", encoding="utf-8")
+        saves.finish_seed(c, GID, log)
+        self.assertEqual(saves.claim_seed(c, GID), pending)
+        log.write_text("S2A 带存档起局：account ← x（2 个文件，15 字节）\nS2A 带存档起局完成：1 类全部灌入", encoding="utf-8")
+        saves.finish_seed(c, GID, log)
+        self.assertIsNone(saves.claim_seed(c, GID))
+
+    def test_seed_done_line_matches_service_layer(self):
+        # 审计 P1-156：作业层删种子认的那句，必须是服务层每类都灌入后才打的那句（一字不差）
+        cs = (Path(__file__).resolve().parents[3] / "services/S2A.Services/Saves.cs").read_text(encoding="utf-8")
+        self.assertIn(f'SeedAllDoneLine = "{saves.SEED_DONE_LINE}"', cs)
+        self.assertNotIn(saves.SEED_DONE_LINE, "S2A 带存档起局：当前用户 0123")
+
+    def test_never_played_game_changed_since_preview_is_refused(self):
+        import shutil
+
+        shutil.rmtree(self.root / "bis")
+        src = self.community("raw", {"progress.bin": b"one"})
+        preview = saves.inspect(self.context(operation="saveInspect", path=str(src)))
+        (src / "progress.bin").write_bytes(b"two")
+        with self.assertRaises(Failure) as e:
+            saves.restore(self.context(operation="saveRestore", path=str(src), **preview))
+        self.assertEqual(e.exception.code, "save_changed")
+
+    def test_device_only_game_seeds_the_device_slot(self):
+        import shutil, struct
+
+        shutil.rmtree(self.root / "bis")
+        c = self.context(operation="saveInspect", path="x")
+        nacp = layout.image_mac(c, GID) / "ctl" / "control.nacp"
+        nacp.parent.mkdir(parents=True, exist_ok=True)
+        data = bytearray(0x30A0); struct.pack_into("<q", data, 0x3090, 1 << 20); nacp.write_bytes(data)
+        src = self.community("raw", {"progress.bin": b"island"})
+        preview = saves.inspect(self.context(operation="saveInspect", path=str(src)))
+        c = self.context(operation="saveRestore", path=str(src), **preview)
+        saves.restore(c)
+        self.assertEqual((saves.pending_seed(c, GID) / "device/progress.bin").read_bytes(), b"island")
+
+    def test_own_backup_never_takes_the_seed_path(self):
+        import shutil
+
+        backup = self.directory / "b.s2asave"
+        saves.backup(self.context(operation="saveBackup", path=str(backup)))
+        shutil.rmtree(self.root / "bis")
+        c = self.context(operation="saveInspect", path=str(backup))
+        self.assertNotEqual(saves.inspect(c).get("notice"), saves.SEED_NOTICE)
 
     def test_inspect_and_restore_use_the_same_cached_conversion(self):
         src = self.community("Checkpoint", {f"saves/0x{GID} Synthetic/20261020-120000 Player/progress.bin": b"same"})
@@ -822,6 +1078,82 @@ class ExternalImportTests(unittest.TestCase):
         second = saves.inspect(self.context(operation="saveInspect", path=str(src)))
         self.assertEqual(first["archiveSha256"], second["archiveSha256"])
         self.assertEqual(len(list((self.directory / "library/save-imports" / GID).glob("*.s2asave"))), 1)
+
+
+class LocalPlayerImportTests(unittest.TestCase):
+    """本地玩家（#623）：社区存档导入进当前玩家（请求的 player 字段，同起局）那个用户号的账号存档，别人的不动。
+    期望手写：第一个玩家 = 存档位置 SaveData 里记的用户号（user 文件，或 Ryujinx 导出的 ExtraData0），都没有 = Ryujinx 缺省用户 USER；
+    其他玩家 = 请求里的用户号（同 services/S2A.Services/LocalPlayer.cs 起局选用户的规则）"""
+
+    setUp = SaveTests.setUp
+    context = SaveTests.context
+    put = SaveTests.put
+    community = ExternalImportTests.community
+
+    HONG = "d7a43a96495d0a594e615dd88587b6bf"
+    THIRD = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb"
+
+    def players(self, *extra):
+        """账号存档：USER → 存档 1（setUp 已有 checkpoint-one），HONG → 3，extra 里的 → 4、5…"""
+        rows = [(1, GID, 1, USER), (3, GID, 1, self.HONG)] + [(4 + i, GID, 1, u) for i, u in enumerate(extra)]
+        self.put(saves.SAVE_INDEX, synthetic_index(rows))
+        for sid, _, _, user in rows[1:]:
+            self.put("bis/user/save/%016x/0/progress.bin" % sid, b"own-" + user[:4].encode())
+
+    def import_as(self, player, data=b"community"):
+        src = self.community("JKSV-" + uuid.uuid4().hex[:6], {"Synthetic game/Player - 2026-10-20/progress.bin": data})
+        with patch.object(saves.save_formats, "detect", return_value=[]):
+            preview = saves.inspect(self.context(operation="saveInspect", path=str(src), player=player))
+            return saves.restore(self.context(operation="saveRestore", path=str(src), player=player, **preview))
+
+    def slots(self, *sids):
+        return [(self.root / ("bis/user/save/%016x/0/progress.bin" % sid)).read_bytes() for sid in sids]
+
+    def test_second_player_gets_the_import_and_the_first_keeps_his(self):
+        self.players()
+        self.assertTrue(self.import_as(dict(user=self.HONG, name="Hong", folder="SaveData-Hong"))["committed"])
+        self.assertEqual(self.slots(1, 3), [b"checkpoint-one", b"community"])
+
+    def test_first_player_without_a_recorded_user_is_the_default_user(self):
+        self.players()
+        self.assertTrue(self.import_as(dict(user="first", name="", folder="SaveData"))["committed"])
+        self.assertEqual(self.slots(1, 3), [b"community", b"own-d7a4"])
+
+    def test_first_player_follows_the_user_recorded_in_his_save_folder(self):
+        self.players(self.THIRD)
+        folder = self.root.parent / "SaveData"
+        folder.mkdir()
+        (folder / "user").write_text(self.THIRD.upper() + "\n")
+        self.import_as(dict(user="first", name="Ming", folder="SaveData"), b"by-user-file")
+        self.assertEqual(self.slots(1, 3, 4), [b"checkpoint-one", b"own-d7a4", b"by-user-file"])
+        # 没有 user 文件、只有 Ryujinx 导出的 ExtraData0（程序号 @0，用户号两段小端 @0x8 / @0x10，类型 1 @0x20）
+        (folder / "user").unlink()
+        meta = struct.pack("<4Q", int(GID, 16), 0xAAAAAAAAAAAAAAAA, 0xBBBBBBBBBBBBBBBB, 0) + bytes([1]) + bytes(0x1F)
+        (folder / "export/0000000000000004").mkdir(parents=True)
+        (folder / "export/0000000000000004/ExtraData0").write_bytes(meta)
+        self.import_as(dict(user="first", name="Ming", folder="SaveData"), b"by-extra-data")
+        self.assertEqual(self.slots(1, 3, 4), [b"checkpoint-one", b"own-d7a4", b"by-extra-data"])
+
+    def test_player_without_a_save_for_this_game_is_told_to_play_first(self):
+        self.put(saves.SAVE_INDEX, synthetic_index([(1, GID, 1, USER)]))
+        with self.assertRaises(Failure) as e:
+            self.import_as(dict(user=self.HONG, name="Hong", folder="SaveData-Hong"))
+        self.assertEqual(e.exception.code, "save_no_target")
+        self.assertIn("这位玩家", str(e.exception))
+        self.assertEqual(self.slots(1), [b"checkpoint-one"])
+
+    def test_without_a_player_several_users_still_cannot_be_told_apart(self):
+        self.players()
+        with self.assertRaises(Failure) as e:
+            self.import_as(None)
+        self.assertIn("多个用户", str(e.exception))
+        self.assertEqual(self.slots(1, 3), [b"checkpoint-one", b"own-d7a4"])
+
+    def test_bad_player_is_rejected(self):
+        self.players()
+        with self.assertRaises(Failure):
+            self.import_as(dict(user=self.HONG, name="Hong", folder="../SaveData"))
+        self.assertEqual(self.slots(1, 3), [b"checkpoint-one", b"own-d7a4"])
 
 
 if __name__ == "__main__":

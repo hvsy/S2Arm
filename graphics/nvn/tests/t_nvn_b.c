@@ -107,6 +107,37 @@ int main(int argc, char **argv) {
     CHECK(CROP, b.pre == guard && b.post == guard);
     CHECK(NATIVE, b.pre == guard && b.post == guard);
 
+    // 原生窗口交换间隔同步（11-13，hle_nvn.c nat_itv；帧率金手指直接写系统原生窗口 +0xF14）：对象头「dnw_」且 +0xF14 是系统缺省 1 时，
+    //   建窗口写进游戏要的间隔、游戏改间隔跟着写、外部改了 GetPresentInterval 读回来；对象头不认就一处都不碰。期望手写
+    {
+        static uint8_t nat[0x1000], raw[0x1000];
+        memcpy(nat, "dnw_", 4); memcpy(nat + 0xf14, &(int32_t){1}, 4); memcpy(raw + 0xf14, &(int32_t){1}, 4);
+        window_box c, d; memset(&c, 0, sizeof c); memset(&d, 0, sizeof d);
+        int32_t v;
+        API(nvnWindowBuilderSetDefaults)(&b.value); API(nvnWindowBuilderSetTextures)(&b.value, 2, first);
+        API(nvnWindowBuilderSetNativeWindow)(&b.value, nat); API(nvnWindowBuilderSetPresentInterval)(&b.value, 2);
+        if (!API(nvnWindowInitialize)(&c.value, &b.value)) return 2;
+        memcpy(&v, nat + 0xf14, 4); CHECK(NATIVE, v == 2);
+        API(nvnWindowSetPresentInterval)(&c.value, 3); memcpy(&v, nat + 0xf14, 4); CHECK(NATIVE, v == 3);
+        memcpy(nat + 0xf14, &(int32_t){1}, 4); CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&c.value) == 1);
+        // 外部写原生窗口：5 是真机上限、照收（原先只认 0–4 被丢）；超界（1000）按 0。期望手写
+        memcpy(nat + 0xf14, &(int32_t){5}, 4); CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&c.value) == 5);
+        memcpy(nat + 0xf14, &(int32_t){1000}, 4); CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&c.value) == 0);
+        memcpy(nat + 0xf14, &(int32_t){1}, 4); CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&c.value) == 1);
+        API(nvnWindowBuilderSetNativeWindow)(&b.value, raw);
+        if (!API(nvnWindowInitialize)(&d.value, &b.value)) return 2;
+        memcpy(&v, raw + 0xf14, 4); CHECK(NATIVE, v == 1); CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&d.value) == 2);
+        // 超出真机上限（MAX_PRESENT_INTERVAL 5）的间隔按 0（不等垂直同步）：帧率补丁把参数改成 1000，原先照收、每帧等 1000 拍（11-14 实机画面停住）。
+        //   期望手写：设 1000 → 读回 0、原生窗口也写 0；设 5 → 5（上限照收）；构建器给 1000 → 建出的窗口间隔 0
+        API(nvnWindowSetPresentInterval)(&c.value, 1000); CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&c.value) == 0);
+        memcpy(&v, nat + 0xf14, 4); CHECK(NATIVE, v == 0);
+        API(nvnWindowSetPresentInterval)(&c.value, 5); CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&c.value) == 5);
+        window_box e; memset(&e, 0, sizeof e);
+        API(nvnWindowBuilderSetNativeWindow)(&b.value, NULL); API(nvnWindowBuilderSetPresentInterval)(&b.value, 1000);
+        if (!API(nvnWindowInitialize)(&e.value, &b.value)) return 2;
+        CHECK(NATIVE, API(nvnWindowGetPresentInterval)(&e.value) == 0);
+    }
+
     for (int i = 0; i < 4; i++) API(nvnTextureFinalize)(&textures[i]);
     printf("%s t_nvn_b %s: %u assertions, %u mismatches\n", bad ? "✗" : "✓", query ? query : "window queries", checks, bad);
     return bad != 0;

@@ -18,6 +18,8 @@ public enum EngineTarget: String, CaseIterable {
     case mac = "macos-arm64"
     /// iPhone / iPad 安装包（IPA + 资源包）。
     case iPhone = "ios-arm64"
+    /// Apple TV（tvOS）安装包：同 iPhone 一样出容器件 + 资源包（作业层 ipa 作业带 platform = "tvos"）。
+    case appleTV = "tvos-arm64"
 }
 
 /// 引擎能力（设计稿：targets、Switch 2、120 fps、render scale、cheats、cloud saves、runtime shaders）。
@@ -73,9 +75,13 @@ public struct BuildJob {
     public var deviceTarget: [String: Any]?
     /// 空间预检没过时玩家选了「仍然继续」。
     public var spaceOverride = false
+    /// 同一款这次还要接着出别的平台（只对 iPhone 有意义）：作业层收尾先不清解包（pack/contracts/README.md，剃刀 M21）
+    public var followUp = false
+    /// 出包页选的存放位置（游戏库结构 v3）：这款放到哪个文件夹；在别的位置就先整个搬过去。nil = 不动
+    public var location: String?
 
-    public init(gameId: String, target: EngineTarget, deviceTarget: [String: Any]? = nil, spaceOverride: Bool = false) {
-        self.gameId = gameId; self.target = target; self.deviceTarget = deviceTarget; self.spaceOverride = spaceOverride
+    public init(gameId: String, target: EngineTarget, deviceTarget: [String: Any]? = nil, spaceOverride: Bool = false, location: String? = nil) {
+        self.gameId = gameId; self.target = target; self.deviceTarget = deviceTarget; self.spaceOverride = spaceOverride; self.location = location
     }
 }
 

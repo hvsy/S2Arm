@@ -23,6 +23,7 @@
 #include <time.h>
 
 #include "mtl_vk_adapter.h"
+#include "nvn_vsync_android.h"   // nvn_be_link_* 节拍源：debug.s2a.vsync 门内的 AChoreographer 拍
 #include "nvn_obj.h"
 #include "redlog.h"
 #pragma weak nvn_ga2ca
@@ -104,7 +105,7 @@ static uint64_t g_lost_from_fence;
 // 已经拿到完成证明的提交上界（guest fence 号）。只按调用方传入的 fence 推进，不拿 g_fence 反推：
 // 多线程下别的线程可能已经发布了更大的 fence 号但作业还没回放。
 static _Atomic uint64_t g_completed_fence;
-static uint64_t g_present_n;
+static _Atomic uint64_t g_present_n;
 static double g_present_at[256];
 static uint64_t g_submits, g_commands, g_draws_skipped;
 static int g_depth_zero, g_origin_lower_left, g_tex_pool_n, g_frame_set;
@@ -184,6 +185,17 @@ static void shim_note_completed(uint64_t through) {
 static int shim_on_gfx_thread(void) {
     return g_gfx_tid_valid && pthread_equal(pthread_self(), g_gfx_tid);
 }
+// ADPF 帧跨距：排队作业按执行时所在的帧序号记账（序号只在 shim_frame_settle 翻转，
+// 即每条 present 出口的末尾；所以「两次 settle 之间执行的作业」就是这一帧的工作）。
+// 独立 NVN 探针可能不链接宿主提示模块，弱符号缺失时整块不启用。
+extern void s2a_adpf_work_begin(uint64_t seq) __attribute__((weak));
+extern void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq) __attribute__((weak));
+extern void s2a_adpf_discard(void) __attribute__((weak));
+extern void s2a_adpf_invisible(void) __attribute__((weak));
+static _Atomic uint64_t g_frame_seq;
+static void adpf_work_tick(void) {
+    if (s2a_adpf_work_begin) s2a_adpf_work_begin(atomic_load(&g_frame_seq) + 1);
+}
 static void *shim_gfx_main(void *arg) {
     (void)arg;
     pthread_setname_np(pthread_self(), "s2a-gfx");
@@ -198,6 +210,7 @@ static void *shim_gfx_main(void *arg) {
         g_busy = 1;
         pthread_cond_broadcast(&g_idle_cv);   // 腾出槽位，阻塞的入队方可以继续
         pthread_mutex_unlock(&g_job_mu);
+        adpf_work_tick();
         job.fn(job.arg);
         pthread_mutex_lock(&g_job_mu);
         g_busy = 0;
@@ -279,9 +292,9 @@ static void job_reset_state(void *arg) { (void)arg; s2a_record_reset_state(); }
 
 // 入队：有界；队列满时有界等待（等到有空位或超时），绝不无界增长。
 static int shim_enqueue(void (*fn)(void *), void *arg) {
-    if (shim_async_mode() == SHIM_ASYNC_OFF || shim_on_gfx_thread()) { fn(arg); return 0; }
+    if (shim_async_mode() == SHIM_ASYNC_OFF || shim_on_gfx_thread()) { adpf_work_tick(); fn(arg); return 0; }
     shim_async_start();
-    if (shim_async_mode() == SHIM_ASYNC_OFF) { fn(arg); return 0; }
+    if (shim_async_mode() == SHIM_ASYNC_OFF) { adpf_work_tick(); fn(arg); return 0; }
     const uint64_t t0 = shim_now_ns();
     pthread_mutex_lock(&g_job_mu);
     while (g_job_n == SHIM_JOB_MAX && !g_gfx_stop) {
@@ -341,6 +354,10 @@ static void shim_frame_settle(void) {
     g_frame_first_draw_marked = 0;
     g_frame_exec_ns = 0;
     g_frame_cmds = 0;
+    // 帧边界：drain 之后的作业记到下一帧。必须在 drain 之后翻，否则在 drain 里执行完
+    // 的本帧作业会拿错序号；也不清 pending——晚于 end 登记的作业带旧序号，下一帧的
+    // end 按序号对不上自然丢弃。
+    atomic_fetch_add(&g_frame_seq, 1);
 }
 static void shim_async_stop(void) {
     if (!g_gfx_tid_valid) return;
@@ -355,6 +372,7 @@ static void shim_async_stop(void) {
 
 // 供 provider stop 调用：先把队列跑空，再唤醒并 join 翻译线程。
 void s2a_mtl_async_stop(void) {
+    s2a_android_link_stop();   // 显示节拍源同步退（节拍独立于异步档，先停）
     if (shim_async_mode() == SHIM_ASYNC_OFF || !g_gfx_tid_valid) return;
     shim_drain();
     shim_async_stop();
@@ -400,7 +418,7 @@ static int exec_chain(const uint8_t *pc, int depth) {
             // 只有打开 debug.s2a.timeline 才会走到这里：关闭时每条命令都不取墙钟。
             extern void nvn_vk_frame_stats_tl_mark(uint64_t, int, double) __attribute__((weak));
             if (nvn_vk_frame_stats_tl_mark) {
-                uint64_t fid = g_present_n + 1;
+                uint64_t fid = atomic_load_explicit(&g_present_n, memory_order_relaxed) + 1;
                 double now = shim_now_ns() / 1e9;
                 if (g_frame_cmds == 0) nvn_vk_frame_stats_tl_mark(fid, 0 /* FIRST_CMD */, now);
                 if (shim_is_draw_op(h.op) && !g_frame_first_draw_marked) {
@@ -458,7 +476,8 @@ void mtl_finish(void) {
         return;
     }
     info("mtl_finish: submits=%llu commands=%llu presents=%llu (queue finish, session kept)",
-         (unsigned long long)g_submits, (unsigned long long)g_commands, (unsigned long long)g_present_n);
+         (unsigned long long)g_submits, (unsigned long long)g_commands,
+         (unsigned long long)atomic_load_explicit(&g_present_n, memory_order_relaxed));
     if (s2a_vk_adapter_finish()) red("mtl_finish: queue did not complete; resources retained");
     else shim_note_completed(atomic_load(&g_replayed_fence));
 }
@@ -489,8 +508,12 @@ void mtl_sub_begin(void) {
     // 保守档：在开始下一次提交之前把队列跑空。这保证 game 复用/释放上一提交的命令内存时，
     // 翻译线程已经不再读它——代价是只在「上一次 commit 到这一次 begin」之间能重叠。
     if (shim_async_mode() == SHIM_ASYNC_CONSERVATIVE) shim_drain();
+    // 回放状态只在本进程第一次提交前复位（同 Metal nvn_be_exec 的 inited）：NVN 的绑定状态挂在队列上，
+    // 上一批命令设的池 / 程序 / 绑定下一批仍然有效。每次提交都清零的话，游戏只在早先的提交里设过一次的
+    // 采样器池到首笔 draw 时已是 0，编译请求缺 samplerArrayLength 被拒（#539）。
     // 复位必须排在本次提交的 exec 作业之前，所以也走队列（不能就地做，会和 worker 上的状态打架）。
-    shim_enqueue(job_reset_state, NULL);
+    static int state_inited;
+    if (!state_inited) { state_inited = 1; shim_enqueue(job_reset_state, NULL); }
     s2a_record_flat_reset();
 }
 
@@ -549,7 +572,7 @@ uint64_t mtl_sub_commit(void) {
         if (clone_append((const uint8_t *)&end, sizeof end) == 0) {
             struct shim_flat *sh = (struct shim_flat *)malloc(sizeof *sh);
             if (sh) {
-                sh->buf = NULL; sh->len = 0;
+                sh->buf = NULL; sh->len = 0; sh->fence = f;
                 sh->buf = s2a_record_flat_take(&sh->len);   // 定稿：落记录内地址并把所有权交出来
                 if (sh->buf && shim_enqueue(job_flat, sh) == 0) {
                     queued = 1;
@@ -659,6 +682,11 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 }
 
 // ---------------- 上屏 ----------------
+// This backend resolves and uploads the source in nvn_vk_session_present_tex
+// after shim_drain; it has no separate present-thread initialization to publish.
+void nvn_be_present_target(int interval, uint64_t set_ns) { (void)interval; (void)set_ns; }   // 按目标帧率分段的「分时」只在回放核心（rp_present.c）
+void nvn_be_present_prepare(const tex_t *t) { (void)t; }
+
 // provider_vk.c 提供：会话激活早于窗口就绪时，这里再向 WSI lease 要一次窗口；窗口换代/
 // 尺寸变化（旋转）也在这里拆旧交换链后重建。返回值：0 = 已有可用窗口；1 = 当前没有窗口
 // （正常跳过 present）；-1 = 上一代呈现退休没有证明（必须失败，不能继续用旧 surface）。
@@ -671,8 +699,8 @@ __attribute__((weak)) int s2a_direct_vk_try_attach_window(void);
 
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     nvk_require();
-    (void)period_s;
     if (g_lost_from_fence) {
+        if (s2a_adpf_discard) s2a_adpf_discard();   // 本帧不完整：挂着的跨距不上报
         static int noted;
         if (noted++ < 8)
             red("mtl_present: an earlier submit (%llu) lost its command chain; refusing to present incomplete content",
@@ -688,6 +716,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         s2a_direct_vk_try_attach_window();
     }
     if (!mtl_has_window()) {
+        if (s2a_adpf_invisible) s2a_adpf_invisible();   // 不可见即关会话，下一可见帧重建
         // 窗口已被 surfaceDestroyed 撤销、新 generation 还没到：这帧没有可上屏的 surface，
         // 跳过 present（不是“丢命令继续跑”，也不需要 abort）。真机从后台返回/旋转后由
         // 晚挂路径拿到新 generation 再继续；之前这里会 red("no game window attached") 把进程打崩。
@@ -712,13 +741,22 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     // 激进度：只在 present 前 drain。此时本帧所有提交都已入队，翻译线程可与游戏线程
     // “录制本帧”并行；代价是依赖“游戏不会在本帧内改写上一帧的动态缓冲”这个前提（需真机验画面）。
     shim_drain();
+    // ADPF：报「本帧第一批翻译工作 → drain 完成」这段真实关键路径墙钟；目标用共用前端
+    // 给的生效上屏间隔。drain 之后的 acquire/上屏等待是 pacing，不是工时；序号只对
+    // 本帧 pending，跳帧/丢帧留下的记录在这里自然丢弃。
+    if (s2a_adpf_frame_end) {
+        double ns = period_s * 1e9;
+        s2a_adpf_frame_end(ns > 0 && ns < 9.223372036854776e18 ? (int64_t)ns : 0,
+                           atomic_load(&g_frame_seq) + 1);
+    }
     char why[192] = "";
     uint64_t t_present = shim_now_ns();
     {
         // 时间线：本帧命令执行结束（进入上屏调用之前）。这一打点与是否延迟 present 无关。
         extern void nvn_vk_frame_stats_tl_mark(uint64_t, int, double) __attribute__((weak));
         if (nvn_vk_frame_stats_tl_mark)
-            nvn_vk_frame_stats_tl_mark(g_present_n + 1, 2 /* EXEC_END */, (double)t_present / 1e9);
+            nvn_vk_frame_stats_tl_mark(atomic_load_explicit(&g_present_n, memory_order_relaxed) + 1,
+                                       2 /* EXEC_END */, (double)t_present / 1e9);
     }
     const uint64_t replayed_before_present = atomic_load(&g_replayed_fence);
     int prc = s2a_vk_adapter_present_tex(t, crop, why, sizeof why);
@@ -727,6 +765,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         // present 会报 no game window attached。这是正常的 BACK/HOME/旋转竞态，
         // 按“本帧无窗口、完成证明收尾、跳过上屏”处理，不能当成致命错误 abort。
         if (!mtl_has_window()) {
+            if (s2a_adpf_invisible) s2a_adpf_invisible();
             static int noted;
             if (noted++ < 8) info("mtl_present: window revoked during present (%s); frame drained, present skipped",
                                   why[0] ? why : "no window");
@@ -756,7 +795,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         shim_note_completed(replayed_before_present);
     }
     uint64_t present_ns = shim_now_ns() - t_present;
-    uint64_t n = ++g_present_n;
+    uint64_t n = atomic_fetch_add_explicit(&g_present_n, 1, memory_order_relaxed) + 1;
+    // 每上一帧调一次共用 ap_host 的上屏出口：内部一次带上 dguard 帧证据、停住看门、HUD
+    // 与帧计数全套（同 iOS dm_guest_frame_tick 的口径）。ap_host.c 只在游戏目标里，
+    // 独立直连探针没链就跳过。
+    {
+        extern void s2a_frame_presented(void) __attribute__((weak));
+        if (s2a_frame_presented) s2a_frame_presented();
+    }
     if (n == 1) info("mtl_present: first frame presented (nvn_vk backend, tex %ux%u)",
                      t ? (unsigned)t->d.width : 0u, t ? (unsigned)t->d.height : 0u);
     struct timespec ts;
@@ -778,6 +824,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     {
         extern void nvn_vk_frame_log_present(void) __attribute__((weak));
         if (nvn_vk_frame_log_present) nvn_vk_frame_log_present();
+        extern void s2a_vk_clear_fv_present(void) __attribute__((weak));
+        if (s2a_vk_clear_fv_present) s2a_vk_clear_fv_present();
+        // 逐帧 TSV（iOS frames.tsv 同义）：同一 present 成功点写行；函数内自查开关。
+        extern void nvn_vk_frame_tsv_present(uint64_t, double) __attribute__((weak));
+        if (nvn_vk_frame_tsv_present) nvn_vk_frame_tsv_present(n, now);
     }
     // 出账依赖（维护方审 11-04）：w6_account.py 解析 `draw window: draws=` 与
     // `render pass window: hit=...` 两行，这两行不随 debug.s2a.win_stats 开关；
@@ -1074,13 +1125,24 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 }
 
 void mtl_present_wait(uint64_t ticket) {
-    if (ticket > g_present_n) red("mtl_present_wait: ticket %llu was never issued", (unsigned long long)ticket);
+    if (ticket > atomic_load_explicit(&g_present_n, memory_order_relaxed))
+        red("mtl_present_wait: ticket %llu was never issued", (unsigned long long)ticket);
 }
 
 void mtl_present_flush(void) { nvk_require(); }
 void mtl_present_test_stall(uint64_t ns) { (void)ns; }
-double mtl_presented_time(uint64_t n) { return n && n <= g_present_n && g_present_n - n < 256 ? g_present_at[n % 256] : 0; }
-uint64_t mtl_present_count(void) { return g_present_n; }
+double mtl_presented_time(uint64_t n) {
+    uint64_t count = atomic_load_explicit(&g_present_n, memory_order_relaxed);
+    if (!n || n > count || count - n >= 256) return 0;
+    // B2：display_timing 计量中 → 只报实际上屏时刻，取不到就是 UNKNOWN（0），
+    // 不拿 CPU present 返回时刻冒充（定稿 A6）；扩展缺席的设备维持原口径。
+    extern int nvn_vk_dt_active(void) __attribute__((weak));
+    extern double nvn_vk_dt_shown(uint64_t) __attribute__((weak));
+    if (nvn_vk_dt_active && nvn_vk_dt_shown && nvn_vk_dt_active())
+        return nvn_vk_dt_shown(n);
+    return g_present_at[n % 256];
+}
+uint64_t mtl_present_count(void) { return atomic_load_explicit(&g_present_n, memory_order_relaxed); }
 
 void *mtl_device(void) { return NULL; }   // 没有共享 Metal device：本后端是 Vulkan
 uint64_t mtl_ext_tex(void *tex) { (void)tex; return 0; }
@@ -1115,8 +1177,10 @@ void mtl_set_origin_lower_left(int on) { g_origin_lower_left = on; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
 void mtl_set_frame(uint64_t f) { g_frame = f; g_frame_set = 1; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
-int mtl_link_active(void) { return 0; }
-int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)timeout_ns; return 0; }
+// nvn_be_link_*：显示节拍。debug.s2a.vsync 默认关（等设备 A/B）——关着或未起节拍源时
+// active=0、wait_tick 回 0，hle_nvn 回退自己的 60Hz 时钟，行为与改动前一致。
+int mtl_link_active(void) { return s2a_android_link_active() && mtl_has_window(); }
+int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { return s2a_android_link_wait_tick(vsyncs, timeout_ns); }
 int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 0; }
 void mtl_bad_draw_feat(const char *why) { red("mtl_bad_draw_feat: %s", why ? why : "unsupported draw feature"); }
 int mtl_ui_ghost_rect(float r[4]) { (void)r; return 0; }
@@ -1133,7 +1197,8 @@ void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t 
 void mtl_res_counts(uint32_t tick, const char *why) {
     info("资源 拍 %u（%s）：提交 %llu，命令 %llu，present %llu，上游 draw 未接 %llu",
          tick, why ? why : "", (unsigned long long)g_submits, (unsigned long long)g_commands,
-         (unsigned long long)g_present_n, (unsigned long long)g_draws_skipped);
+         (unsigned long long)atomic_load_explicit(&g_present_n, memory_order_relaxed),
+         (unsigned long long)g_draws_skipped);
 }
 void mtl_res_snapshot(mtl_res_count *out) { if (out) memset(out, 0, sizeof *out); }
 double mtl_gpu_ms(uint64_t f) { (void)f; return 0; }

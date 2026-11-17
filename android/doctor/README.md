@@ -41,7 +41,7 @@ bash android/doctor.sh --format json --plan \
 
 - Dockerfile：JDK、SDK / Build Tools、NDK、CMake、Gradle、固定基础镜像；
 - app/build.gradle、settings.gradle：compileSdk、Java、NDK、CMake、minSdk、AGP；
-- gate.sh：旧内联 case 或当前明确调用的 tools/jdk17.sh 中的严格 JDK 主版本，helper 也记录源码 SHA256；cs/build.sh 与 global.json：普通 SDK 滚动策略和容器**精确** SDK、目标/宿主架构；
+- host/hostenv.sh 与其调用的 tools/jdk17.sh：严格 JDK 主版本，helper 也记录源码 SHA256；cs/build.sh 与 global.json：普通 SDK 滚动策略和容器**精确** SDK、目标/宿主架构；
 - openssl/build.sh、codecs/build.sh：API、NDK、缓存表达式与脚本哈希；
 - services/opus/build.sh、services/vpx/build.sh：沿用跨平台版本/源码 SHA256 正本。
 
@@ -106,7 +106,7 @@ env -i PATH=/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=/tmp \
 | dotnet_inventory | 10.0.301，`rollForward=latestFeature` | missing。PATH 中无 `dotnet` |
 | nativeaot_sdk / nativeaot_sdk_host | 缓存内 Linux x64 SDK 10.0.301 | missing。路径 `/cache/dotnet/10.0.301` |
 | nativeaot_restore / nativeaot_runtime | 精确 `linux-bionic-arm64` 还原及运行包 | restore missing（`/workspace/build/android-cs/probe/obj/project.assets.json` 不存在）；runtime unverified |
-| openssl / opus / vpx | 缓存内 ELF / archive 与许可证 | missing。路径 `/cache/openssl/3.5.9-ndk29-api29`、`/cache/codecs/opus-1.6.1-ndk29-api29-3248d806e947`、`/cache/codecs/vpx-1.15.0-ndk29-api29-3248d806e947` |
+| openssl / opus / vpx | 缓存内 ELF / archive 与许可证 | missing。路径 `/cache/openssl/3.5.9-ndk29-api29`、`/cache/codecs/opus-1.6.1-ndk29-api29-3248d806e947`、`/cache/codecs/vpx-1.17.0-ndk29-api29-3248d806e947` |
 | nativeaot_host | `linux-x64 / linux-x86_64` | ok。`{'os':'Linux','arch':'x86_64'}` |
 | docker / docker_image | 已在跑的 daemon；镜像 `linux/amd64` | docker missing（无 CLI）。镜像 unverified，名为 `s2arm-android-build:1` |
 | offline_resolution | 完整依赖闭包 | unverified |

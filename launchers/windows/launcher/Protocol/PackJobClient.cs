@@ -40,7 +40,8 @@ public sealed class JobEventReader(string jobId, string operation)
                 if (state != "running") throw new LibraryProtocolException("Terminal state lacks a result event.");
                 return e.Clone();
             }
-            if (state is not ("succeeded" or "failed" or "cancelled"))
+            // paused：出包编排停在要玩家处理的点上（磁盘满 / 启动器退出，剃刀 H13 pack/jobs/export_plan.py），不算完成也不算失败
+            if (state is not ("succeeded" or "failed" or "cancelled" or "paused"))
                 throw new LibraryProtocolException("Unknown terminal result state.");
             var payload = e.GetProperty("result");
             if (payload.ValueKind != JsonValueKind.Object) throw new LibraryProtocolException("Result must be an object.");
@@ -58,7 +59,7 @@ public sealed class JobEventReader(string jobId, string operation)
     public LibraryJobResult Finish(int exitCode)
     {
         if (Result is null) throw new LibraryProtocolException("EOF without a terminal result.");
-        if (exitCode != (Result.State == "succeeded" ? 0 : Result.State == "cancelled" ? 130 : 1))
+        if (exitCode != (Result.State is "succeeded" or "paused" ? 0 : Result.State == "cancelled" ? 130 : 1))
             throw new LibraryProtocolException("Terminal result disagrees with process exit.");
         return Result;
     }
@@ -66,52 +67,72 @@ public sealed class JobEventReader(string jobId, string operation)
 
 /// <summary>
 /// Export / install operations of <c>pack/jobs/main.py run --request</c>:
-/// the iPhone package (ipa), the pre-install checklist (installCheck) and install. Same private request, same fixed
+/// the iPhone package (ipa), the pre-install checklist (installCheck) and install, plus the per-game library operations of
+/// library layout v3 (moveGame / relinkGame / forgetGame, clean = clear cache). Same private request, same fixed
 /// command line and same cancel path as the library operations; events stream to the caller as they arrive.
 /// </summary>
 public static class PackJobClient
 {
-    public static readonly IReadOnlySet<string> Operations =
-        new HashSet<string>(StringComparer.Ordinal) { "ipa", "installCheck", "install", "installRemove" };
+    // 操作名不在前端设白名单（11-15：前端清单是自己给自己加的卡点——0.4.0 漏登记两页，请求进引擎前就被拒，#1149 卡死）：
+    //   请求原样交给引擎，引擎不认识的操作自己回失败结果（pack/jobs/main.py「不支持的任务类型。」），界面把它当普通失败显示成文字
 
+    /// <param name="Secrets">Environment variables for this one job process only (the developer certificate password,
+    /// pack/jobs/devcert.py); never written into the request file, and main.run_request drops them from its environment first.</param>
     public sealed record Request(LauncherPaths Paths, string PrivateRoot, string Library, string LibraryId, string Operation,
-        string GameId, IReadOnlyDictionary<string, object?>? Extra = null);
+        string GameId, IReadOnlyDictionary<string, object?>? Extra = null, IReadOnlyDictionary<string, string>? Secrets = null);
 
     /// <summary>The request body the backend reads (pure; unit-tested).</summary>
     public static Dictionary<string, object?> Payload(Request request, string jobId)
     {
-        if (!Operations.Contains(request.Operation)) throw new ArgumentException("Unsupported pack operation.", nameof(request));
-        if (string.IsNullOrWhiteSpace(request.GameId)) throw new ArgumentException("A game is required.", nameof(request));
+        // The developer certificate and the install mode belong to this computer, installUpdate to the phone (install.update_phone): no game.
+        // export 的游戏在计划里（plan.items，ExportStream），信封上不带
+        // 要不要游戏号由作业层自己判（自己人之间不设允许清单，#1149）：有就带，没有就不带；要游戏的作业缺了由作业层报「请求里没有游戏号」。
+        //   原先这里按名单要求带游戏号，名单漏登的 phoneKeptPull / installUpdatePrepare 在这一步抛异常、被循环吞掉，Windows 上自动更新一次都没发出去（0.5.0 候选验收）
         var payload = new Dictionary<string, object?>
         {
             ["schema"] = 1, ["jobId"] = jobId, ["operation"] = request.Operation,
             ["privateRoot"] = Path.GetFullPath(request.PrivateRoot), ["library"] = Path.GetFullPath(request.Library),
-            ["engineDir"] = Path.GetFullPath(request.Paths.Engine), ["libraryId"] = request.LibraryId, ["gameId"] = request.GameId,
+            ["engineDir"] = Path.GetFullPath(request.Paths.Engine), ["libraryId"] = request.LibraryId,
             // The job stops itself when this launcher process is gone (main.py supervise).
             ["parentPid"] = Environment.ProcessId
         };
+        if (!string.IsNullOrWhiteSpace(request.GameId)) payload["gameId"] = request.GameId;
         // The bundled iPhone shell is a launcher path setting (Settings → Shell); ipa.bundled_shell reads shellDir.
-        if (request.Operation is "ipa" or "install") payload["shellDir"] = Path.GetFullPath(request.Paths.Shell);
-        // Bundled resources next to S2Arm.exe (bundle_win.py layout): ipa reads the shared fonts from resources/Fonts (core.fonts_dir; without it
+        // export 的每一步子作业沿用这份请求（pack/jobs/export_plan.py），iPhone 那步要的壳与随包资源一并带上
+        if (request.Operation is "ipa" or "install" or "installUpdate" or "export") payload["shellDir"] = Path.GetFullPath(request.Paths.Shell);
+        // Apple TV 预编壳（启动器目录 Shell-tvOS，安装包带了才有）：tvos.tv_shell / derive 读 tvShellDir，Windows 不能现出壳
+        var tvShell = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(request.Paths.Shell)) ?? "", "Shell-tvOS");
+        if (request.Operation is "ipa" or "export" && Directory.Exists(tvShell)) payload["tvShellDir"] = tvShell;
+        // Bundled resources next to S2Arm.exe (bundle_win.py layout): sgradeScan reads CommunityPatches/patches-v3.tar (v2 on older installs);
+        // ipa reads the shared fonts from resources/Fonts (core.fonts_dir; without it
         // "shared fonts missing", tianyan 11-07); installCheck / install use the Impactor + plumesign shipped in resources/ThirdParty/Impactor
         // (pack/jobs/impactor.py bundled, 11-07 维护者: no download detour for players).
-        if (request.Operation is "ipa" or "installCheck" or "install" or "installRemove") payload["resources"] = Path.GetFullPath(AppContext.BaseDirectory);
+        if (request.Operation is "ipa" or "export" or "installCheck" or "install" or "installRemove" or "installRestore" or "installMode" or "installUpdate" or "sgradeScan") payload["resources"] = Path.GetFullPath(AppContext.BaseDirectory);
         foreach (var (key, value) in request.Extra ?? new Dictionary<string, object?>())
         {
             if (payload.ContainsKey(key)) throw new ArgumentException("Extra field overrides the request envelope: " + key);
             payload[key] = value;
         }
+        // Library layout v3 (pack/jobs/library.py): a storage location / game folder is an absolute path chosen by the player;
+        // moveGame / relinkGame need theirs, ipa may carry one (export page), clean is offered only as "clear cache".
+        foreach (var (operation, key, required) in new[] { ("ipa", "location", false), ("moveGame", "location", true), ("relinkGame", "folder", true) })
+            if (request.Operation == operation && (payload.TryGetValue(key, out var value) ? value is not string path || !Path.IsPathFullyQualified(path) : required))
+                throw new ArgumentException("An absolute folder is required: " + key, nameof(request));
+        if (request.Operation == "clean" && (payload.TryGetValue("kind", out var kind) ? kind as string : null) != "cache")
+            throw new ArgumentException("Only the cache can be cleared here.", nameof(request));
+        JobLanguage.Stamp(payload);   // 界面语言（自签导出的文件夹名 / 说明按它出）
         return payload;
     }
 
-    public static async Task<LibraryJobOutput> RunAsync(Request request, Action<JsonElement>? onEvent, CancellationToken cancellationToken)
+    public static async Task<LibraryJobOutput> RunAsync(Request request, Action<JsonElement>? onEvent, CancellationToken cancellationToken, string? jobId = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var jobId = "win-" + Guid.NewGuid().ToString("N");
+        jobId ??= "win-" + Guid.NewGuid().ToString("N");   // 前端作业登记先取好的任务号（控制口 /cancel 按它核对）；不给就现取
         var privateRoot = Path.GetFullPath(request.PrivateRoot);
-        using var file = PrivateJobRequest.Create(privateRoot, JsonSerializer.Serialize(Payload(request, jobId)));
+        using var file = PrivateJobRequest.Create(privateRoot, JsonOut.Serialize(Payload(request, jobId)));
         var info = EnvironmentProbe.StartInfo(request.Paths, file.FilePath);
         info.Arguments = "/d /v:off /s /c \"\"%S2A_UI_RUNTIME%\\s2arm_env.cmd\" && cd /d \"%S2A_UI_ENGINE%\" && python -X utf8 pack/jobs/main.py run --request \"%S2A_UI_REQUEST%\"\"";
+        foreach (var (key, value) in request.Secrets ?? new Dictionary<string, string>()) info.Environment[key] = value;
         var reader = new JobEventReader(jobId, request.Operation);
         using var process = EnvironmentProbe.StartProcess(info);
         var stderr = new StringBuilder();
@@ -146,8 +167,9 @@ public static class PackJobClient
             if (await Task.WhenAny(finished, interrupted) != finished)
             {
                 await CancelAsync(request.Paths, file.FilePath, privateRoot, jobId);
-                await Task.WhenAny(finished, Task.Delay(TimeSpan.FromSeconds(3)));
-                throw new OperationCanceledException(cancellationToken);
+                // 点取消时作业恰好已经跑完：照它的真实结局走（产物已生成就是已出好），不一律报已取消（社区贡献者补丁 #7）
+                if (await Task.WhenAny(finished, Task.Delay(TimeSpan.FromSeconds(3))) != finished)
+                    throw new OperationCanceledException(cancellationToken);
             }
             await finished;
         }
@@ -165,7 +187,8 @@ public static class PackJobClient
     }
 
     // Ask the job control plane first (it verifies the journal's pid / start time), then stop only our own process tree.
-    private static async Task CancelAsync(LauncherPaths paths, string requestFile, string privateRoot, string jobId)
+    //   唯一一份取消（剃刀 W17：LibraryJobClient 原先另抄一份，#7「3 秒内跑完照真实结局」只改到这边）
+    internal static async Task CancelAsync(LauncherPaths paths, string requestFile, string privateRoot, string jobId)
     {
         using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         try

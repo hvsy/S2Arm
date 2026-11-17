@@ -52,13 +52,13 @@ class EarlyInstall:
     def __init__(self, c, gid, env, out):
         import install as inst
         self.c, self.gid, self.inst, self.env = c, gid, inst, env
-        self.team = inst.pick_team(inst.xcode_teams(env), c.r.get("teamId"))
+        self.team = inst.devcert.team(c) or inst.pick_team(inst.xcode_teams(env), c.r.get("teamId"))
         self.dev = inst.phone(c)
         self.udid = inst.udid_of(c, self.dev["id"])
-        self.bid = inst.container_bundle_id(self.team["id"])
-        self.ready = c.private / "logs" / (c.task + "-early.ready")
+        self.bid = inst.container_bundle_id(self.team["id"], c)
+        self.ready = c.logs / (c.task + "-early.ready")
         self.ready.unlink(missing_ok=True)
-        self.log = c.private / "logs" / (c.task + "-early.log")
+        self.log = c.logs / (c.task + "-early.log")
         self.dir = Path(out) / ".early"
         env["S2A_EARLY_READY"] = str(self.ready)
         self.core = Overlap(self._build, self._install, self._wait)
@@ -81,16 +81,22 @@ class EarlyInstall:
                                 stdout=f, stderr=subprocess.STDOUT, env=self.env, cwd=str(self.c.engine)).returncode
         if rc:
             from core import Failure
-            raise Failure("早装件没出成：" + _last(self.log), code="job_failed")
+            raise Failure("早装件没出成：" + _last(self.log), code="job_failed")  # 非玩家句
         import ipa as packer
-        root = self.c.library / "iPhone" / self.gid / "roots" / (kuan + "@现行")
-        return packer.assemble(self.c, self.gid, root=root.resolve(), dest=self.dir / "container")
+        import layout
+        root = layout.ios_work(self.c, self.gid) / "roots" / (kuan + "@现行")  # 非玩家句
+        rec = layout.load_device(self.c, self.udid or self.dev["id"])   # 这台手机上已有的各款一起带上（早装覆盖装也不能把它们装没）
+        others = [g for g in rec.get("games", {}) if g != self.gid.upper()]
+        with packer.program_locks(self.c, others):   # 别款程序件这段不让它们的出包交付换（这款用的是旁路产物根，不读 kit）
+            return packer.assemble(self.c, self.gid, others, failed=rec.get("failedShells", []), root=root.resolve(), dest=self.dir / "container")
 
     def _install(self, built):
+        import ipa as packer
         ipa, games, _ = built
-        ph = self.inst.MacPhone(self.c, self.team, self.dev, self.udid)
-        ph.install(ipa, games, steps=False)
-        files, size = ph.push(self.gid.upper(), self.dir / "pack")
+        with packer.phone_lock(self.c):   # 早装也是装机：和别的装机类作业一次一个（ipa.phone_lock）
+            ph = self.inst.MacPhone(self.c, self.team, self.dev, self.udid)
+            ph.install(ipa, games, steps=False)
+            files, size = ph.push(self.gid.upper(), self.dir / "pack")
         return dict(files=files, bytes=size)
 
     def finish(self):
@@ -98,7 +104,7 @@ class EarlyInstall:
         result, error = self.core.finish()
         if error is not None:
             # 玩家不用做任何事（正式安装推整包兜底）：只记一条进度消息，不新增错误码
-            self.c.emit("message", "出包期间先装 App、先推资源没成（" + str(error)[:200] + "），装正式包时整包推送")
+            self.c.emit("message", "出包期间先装 App、先推资源没成（" + str(error)[:200] + "），装正式包时整包推送")  # 非玩家句
         return result
 
 

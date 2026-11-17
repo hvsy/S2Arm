@@ -12,6 +12,8 @@
 入	graphics/metal/fit_judge.h
 入	graphics/metal/gal_aa.m
 入	graphics/metal/gal_abi.h
+入	graphics/metal/gal_astc.h
+入	graphics/metal/gal_astc.m
 入	graphics/metal/gal_be.h
 入	graphics/metal/gal_border.m
 入	graphics/metal/gal_buf.m
@@ -85,6 +87,8 @@
 入	graphics/nvn/host
 入	graphics/nvn/host_adapt.m
 入	graphics/nvn/lib_pack.inc
+入	graphics/nvn/lib_pack_core.inc
+入	graphics/nvn/pgo/nvn.prof.txt
 入	graphics/nvn/texture_extent.inc
 入	graphics/nvn/third_party/bcdec/bcdec.h
 入	graphics/nvn/third_party/vulkan-headers
@@ -133,7 +137,10 @@
 入	ios
 入	runtime/ns2pro/LICENSE
 入	runtime/ns2pro/NS2Accessories.c
+入	runtime/ns2pro/NS2Bond.c
 入	runtime/ns2pro/NS2Input.c
+入	runtime/ns2pro/NS2JoyCon.c
+入	runtime/ns2pro/NS2Keep.c
 入	runtime/ns2pro/NS2Module.m
 入	runtime/ns2pro/NS2Motion.c
 入	runtime/ns2pro/NS2Rumble.c
@@ -141,9 +148,11 @@
 入	runtime/ns2pro/NS2Transport.m
 入	runtime/ns2pro/include
 入	runtime/src
+入	runtime/third_party
 入	runtime/tests/mk
 入	pack/app.entitlements
 入	pack/app_bundle.py
+入	pack/container_custom.py
 入	pack/contracts/artifact.v2.schema.json
 入	pack/contracts/compare.py
 入	pack/contracts/job-event.v1.schema.json
@@ -151,17 +160,29 @@
 入	pack/contracts/target.v1.schema.json
 入	pack/contracts/validate.py
 入	pack/display_name.py
+入	pack/jobs/cache_retention.py
+入	pack/jobs/errors.py
 入	pack/pkg_srcs.py
 入	pack/shell/manifest.py
 入	pack/shell_build.sh
 入	pack/ship_ext.py
 入	pack/stage_inputs/shell.tsv
+入	pack/widget.entitlements
+入	pack/widget_ext.py
 入	android/tools/fetch_source.sh
 入	platform/apple/cs
 入	shell
+入	launchers/macos/adapter/Sources/S2ArmAppleAdapter/Resources/Localizable.json
+入	launchers/shared/SaveSync
 入	platform/apple/plat_apple.c
 入	platform/build.mk
 入	launchers/macos/build.mk
+入	launchers/shared/experience.v1.json
+入	launchers/shared/experience_strings.py
+入	launchers/shared/experience_zh_hant.json
+入	launchers/shared/l10n/es.json
+入	launchers/shared/l10n/fr.json
+入	launchers/shared/l10n/ja.json
 入	platform/plat.h
 入	platform/plat_asm.h
 入	compat
@@ -181,6 +202,7 @@
 入	tests/build.mk
 入	tests/visual/build.mk
 入	tests/visual/galrec
+入	tools/_timeout.sh
 入	tools/bin/timeout
 入	tools/build.mk
 入	tools/module_order.py
@@ -188,4 +210,35 @@
 入	tools/toolchain.env
 入	tools/weak_link_decl.py
 外	.gitignore	出壳过程里 git 命令读的忽略规则，不影响壳内容
+外	nuget.config	根目录的 NuGet 源配置，包版本由各工程钉死，不影响壳内容
 外	tools/gmake.sh	出壳挑 GNU Make 4 的路径（开发机工具），不影响壳内容
+
+# 「不」= 不编进壳（pack/shell/closure.py csiblings 用：表里逐文件登记的目录下，C 系文件要么入 / 外、要么在这里写明不编进壳）。
+#   出壳闭包与壳编号都不认这一类；下面 25 个是 11-10 首次核对时的现状，v0.2.3 出壳闭包核过、出壳没读到它们。
+不	android/tools/direct_identity_host.c
+不	graphics/dsx/win_posix.h
+不	graphics/metal/tools/xc_bench.m
+不	graphics/third_party/spirv_cross/main.cpp
+不	graphics/third_party/spirv_cross/spirv_cpp.cpp
+不	graphics/third_party/spirv_cross/spirv_cpp.hpp
+不	graphics/third_party/spirv_cross/spirv_cross_util.cpp
+不	graphics/third_party/spirv_cross/spirv_cross_util.hpp
+不	graphics/third_party/spirv_cross/spirv_hlsl.cpp
+不	graphics/third_party/spirv_cross/spirv_hlsl.hpp
+不	graphics/third_party/spirv_cross/spirv_reflect.cpp
+不	graphics/third_party/spirv_cross/spirv_reflect.hpp
+不	graphics/track/track_platform.h
+不	tests/det_host_queue.c
+不	tests/det_mring_wrap.c
+不	tests/fit_judge_test.c
+不	tests/loader_jumpslot.c
+不	tests/loader_order.c
+不	tests/loader_ro_lookup.c
+不	tests/rewrite_redzone_exec.c
+不	tests/rewrite_signed_jt_exec.c
+不	tests/rewriter_api_test.c
+不	tests/sync_contract_litmus.c
+不	tests/sync_publish_litmus.c
+不	tests/vpad_screen_lock_test.c
+不	tools/dotnet_lock.c
+不	tools/pipeline_timing.m

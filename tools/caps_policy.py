@@ -81,7 +81,7 @@ def sources(root):
     def nonempty(n):
         with open(os.path.join(root, n), encoding='utf-8', errors='replace') as f:
             return any(l.strip() and not l.startswith('#') for l in f)
-    # 第三层不靠逐款表、每款都有（10-29 画面线：八方2 / 马车8 第二层 0 个点也满屏、多档过），逐款表只是增强
+    # 第三层不靠逐款表、每款都有（10-29 画面线：八方2 / 0100152000022000 第二层 0 个点也满屏、多档过），逐款表只是增强
     w = ['第三层通用满屏'] + [n for n in sorted(fs) if n.startswith('widen_enable.') and n.endswith('.tsv')] + (['widen_verified.tsv'] if has('widen_verified.tsv') else []) \
         + [n for n in sorted(fs) if n.startswith('widen_full.') and n.endswith('.tsv')]
     if any(r.get('编号', '').startswith('widescreen:') for r in cp): w.append('社区宽屏补丁')
@@ -96,14 +96,15 @@ def sources(root):
 def engine_l1(root):
     """引擎通用第一层（10-29 60 帧泛化）：graphics/nvn/games/profile_guess.engine 对 Unity / UE4 主程序推导 present_interval_derived=display
     （引擎自己的 targetFrameRate / t.MaxFPS 管限帧，交换间隔放开后逻辑按真实时间推进）。直连宿主按 game_tsv.h s2a_present_decide 放开出图间隔，
-    逻辑速度红（L3 need_l3 / 名单_60帧 红 / 强信号表）才关。产物根没有 exefs + romfs、或推导失败 → False（不算来源，不报错）"""
+    逻辑速度红（L3 need_l3 / 名单_60帧 红 / 强信号表）才关。产物根没有 exefs + romfs → False；推导失败 → False 并在错误输出打【红】行（不算来源、不中断）"""
     ex, rf = os.path.join(root, 'exefs'), os.path.join(root, 'romfs')
     if not (os.path.isdir(ex) and os.path.exists(rf)): return False
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'graphics', 'nvn', 'games')); import profile_guess
         F = profile_guess.facts_of(ex, rf); profile_guess.guess(F)
         return (profile_guess.engine(F).get('present_interval_derived') or ('',))[0] == 'display'
-    except Exception:
+    except Exception as e:   # 审计 P1-138：推导出错照旧不算来源、不中断出包（60 帧还有名单 / 补丁等来源），但必须响亮报出来，不能静默当「不是 Unity / UE」
+        print(f'【红】caps_policy 引擎推导出错（{root}），本次不把引擎通用算作 60 帧来源：{type(e).__name__}: {e}', file=sys.stderr)
         return False
 
 
@@ -321,7 +322,7 @@ def native60(repo, pid, bid):   # 能力覆盖表 L1交换间隔 = L2引擎限�
                for r in rows(os.path.join(repo, 'docs/名单_60帧能力覆盖.tsv')))
 
 
-FPS60_MIN = 57.0   # 60 帧开着的持续平均帧率下限（10-29 维护者：塞尔达 32 帧 / 怪猎崛起 52.5 帧 / 巫师3 38 帧——开了达不到，退回原帧率）
+FPS60_MIN = 57.0   # 60 帧开着的持续平均帧率下限（10-29 维护者：一款第一方动作冒险游戏 32 帧 / 怪猎崛起 52.5 帧 / 巫师3 38 帧——开了达不到，退回原帧率）
 W30_MAX = 3.7      # 30 帧能耗线（同 score_cells.W_MAX）：自适应款主要稳在 30 档时按它判（10-29 维护者「按实际稳住的档用对应能耗线」）
 W60_MAX = 4.8      # 60 帧能耗线（维护者 10-26，与 tools/score_cells.py W_MAX60 同值，tests/caps_policy_test 核一致；不 import 它：改写阶段键不想带 score_cells 全文）
 
@@ -388,9 +389,29 @@ def widen_measured(repo, root, pid, bid, target='apple'):
     return None
 
 
+# 只用社区补丁（11-13 维护者：「补丁方案已经彻底覆盖咱们通用满屏和60帧解锁的功能……撤掉咱们的60帧和通用满屏这一层，用开关实现……
+#   玩家拿到的就是干净的补丁方案或者原生游戏方案」）：fps60 只在有社区帧率补丁时开（60 帧开关此后只是「开关帧率补丁」），其余款原帧率；
+#   widen（我方满屏层）一律关——社区宽屏补丁走自己的开关（runtime/src/cpatch.c、widen.c ws_yield），不看这一键。
+#   S2A_CAPS_OWN=1 回到旧口径（我方帧率表 / 全引擎放开 / 我方满屏各来源照旧算），只给内部对照用
+def patch_only(): return os.environ.get('S2A_CAPS_OWN') != '1'
+
+
 def decide(repo, root, all_caps=False, target='apple'):
     """target ∈ IMPL 的键（apple / android）：强信号失效键、验证账内容哈希、已实测行全部按该平台口径查（F7：苹果验过的行不放行安卓包）"""
     pid, bid = ident(root); src = sources(root)
+    if patch_only():
+        fps = '社区帧率补丁' in src['fps60']
+        # 满屏两者合成一套（维护者 11-15「批了，两者合成一套」，取代 11-13 撤我方通用满屏的满屏那一半）：有社区满屏补丁的款补丁在宿主压过本键（runtime/src/caps.c）；
+        #   没有补丁、但本包在宽屏已验证名单（产物根 widen_verified.tsv，graphics/widen/tables/verified.tsv 按程序号 + main 构建号）→ 我方通用满屏缺省开；
+        #   登记过强信号（判过坏）照旧关；其余 16:9。玩家在设置里手动开 / 关照旧生效
+        wv = 'widen_verified.tsv' in src['widen']
+        sw = None
+        if wv and pid and bid:
+            sw = strong(repo, pid, bid, signal_hashes(repo_reader(repo), target))[0]['widen']
+        widen = (1, '缺省开：本包在宽屏已验证名单（没有社区满屏补丁时用我方通用满屏，维护者 11-15 两者合成一套）') if wv and not sw else \
+            (0, sw or '16:9：没有社区满屏补丁、也不在宽屏已验证名单（维护者 11-15 两者合成一套：验过的才开我方通用满屏）')
+        return {'fps60': (1, '默认开：来源 社区帧率补丁（只用社区补丁）') if fps else (0, '原帧率：没有社区帧率补丁（只用社区补丁，维护者 11-13 撤掉我方 60 帧）'),
+                'widen': widen, 'fps60_display': 0}
     if pid and bid and native60(repo, pid, bid): src['fps60'].append('游戏原生 60 帧')
     st, stale = ({'fps60': None, 'widen': None}, {'fps60': [], 'widen': []}) if all_caps or not (pid and bid) else strong(repo, pid, bid, signal_hashes(repo_reader(repo), target))
     for cap in ('fps60', 'widen'):   # 过时的强信号：本包实现下实测过（验证账同程序号 + 构建号 + 能力 + 本包内容哈希、结论过、没冲突）才放开（10-30 维护者定 (B)）

@@ -23,6 +23,7 @@ public struct GameStateView: View {
             }
             Button(action: perform) { Label(game.state.actionTitle, systemImage: game.state.actionSymbol) }
                 .buttonStyle(PrimaryPillStyle())
+                .disabled(game.state.isArriving)   // 传着 / 解着：开始键在、按不动，能玩了才亮
                 .accessibilityIdentifier("state.action")
                 .accessibilityLabel(game.state.actionTitle + ", " + game.title)
                 .shellTarget("set.play", radius: 25, action: perform)
@@ -41,8 +42,10 @@ public struct GameStateView: View {
         switch game.state {
         case .playable: actions.onPlay(game.id)
         case .needsGameData: actions.onPickGameData(game.id)
-        case .needsAppUpdate: actions.onAppUpdate()
-        case .broken: actions.onShowLog(game.id)
+        case .needsAppUpdate: actions.onAppUpdate?()
+        case .needsGameUpdate, .needsGameReinstall: break   // needsHelp：上面已展开说明
+        case .broken: actions.onShowLog?(game.id)
+        case .installing(let stage): if stage.phase == .failed { actions.onPlay(game.id) }   // 重试解开；传着 / 解着按钮按不动
         }
     }
 }
@@ -68,9 +71,15 @@ public struct StateHelpView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(ShellStrings.text("Details")).shellText(11.5, .semibold).foregroundStyle(.white.opacity(0.5))
                     Text(verbatim: ShellStrings.text("Title ID \(game.id)")).font(.system(size: 12, design: .monospaced)).foregroundStyle(.white.opacity(0.5))
-                        .textSelection(.enabled).accessibilityIdentifier("help.titleid")
+                        #if !os(tvOS)   // tvOS 没有文字选取
+                        .textSelection(.enabled)
+                        #endif
+                        .accessibilityIdentifier("help.titleid")
                     Text(verbatim: technical).font(.system(size: 12, design: .monospaced)).foregroundStyle(.white.opacity(0.5))
-                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        #if !os(tvOS)
+                        .textSelection(.enabled)
+                        #endif
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("help.details")
                 }
             }
@@ -81,16 +90,20 @@ public struct StateHelpView: View {
                     .shellTarget("help.done", radius: 25, action: onClose)
                 switch game.state {
                 case .broken:
-                    Button(ShellStrings.text("Show log")) { actions.onShowLog(game.id) }
-                        .buttonStyle(ShellButtonStyle(fills: true))
-                        .accessibilityHint(ShellStrings.text("For a bug report"))
-                        .accessibilityIdentifier("help.log")
-                        .shellTarget("help.log") { actions.onShowLog(game.id) }
+                    if let showLog = actions.onShowLog {
+                        Button(ShellStrings.text("Show log")) { showLog(game.id) }
+                            .buttonStyle(ShellButtonStyle(fills: true))
+                            .accessibilityHint(ShellStrings.text("For a bug report"))
+                            .accessibilityIdentifier("help.log")
+                            .shellTarget("help.log") { showLog(game.id) }
+                    }
                 case .needsAppUpdate:
-                    Button(ShellStrings.text("Update app")) { actions.onAppUpdate() }
-                        .buttonStyle(ShellButtonStyle(fills: true))
-                        .accessibilityIdentifier("help.update")
-                        .shellTarget("help.update") { actions.onAppUpdate() }
+                    if let update = actions.onAppUpdate {
+                        Button(ShellStrings.text("Update app")) { update() }
+                            .buttonStyle(ShellButtonStyle(fills: true))
+                            .accessibilityIdentifier("help.update")
+                            .shellTarget("help.update") { update() }
+                    }
                 default:
                     EmptyView()
                 }
@@ -105,6 +118,8 @@ public struct StateHelpView: View {
         case .broken(_, let detail, _) where !detail.isEmpty: detail
         case .broken: ShellStrings.text("Build this game again on your Mac and install it on this device. The Mac app checks every file while it builds, so the new copy is complete.")
         case .needsAppUpdate: ShellStrings.text("This game needs a newer version of this app. Update it with the Mac app on your Mac, then install it on this device again.")
+        case .needsGameUpdate: ShellStrings.text("This game was built with an older S2Arm and doesn't match the new version on your phone, so it can't open. Connect your phone to your computer and click \"Update S2Arm on iPhone\" in S2Arm; this game will be rebuilt for the new version.")
+        case .needsGameReinstall: ShellStrings.text("This game's files on your phone didn't finish installing, or were installed from another computer or Apple ID, so they don't match S2Arm on this phone and it can't open. Connect your phone to your computer and click \"Install on iPhone\" for this game in S2Arm to reinstall it.")
         default: ""
         }
     }
@@ -125,7 +140,7 @@ public struct EmptyLibraryView: View {
             SectionHeading(title: ShellStrings.text("Your games"))
             Text(ShellStrings.text("A little room for adventure")).shellType(ShellType.heroTitle(30))
                 .fixedSize(horizontal: false, vertical: true)
-            Text(ShellStrings.text("Your games will appear here when they are included in this app."))
+            Text(ShellStrings.text("Install a game from S2Arm on your computer and it will appear here."))
                 .shellText(15).foregroundStyle(.white.opacity(0.6)).fixedSize(horizontal: false, vertical: true)
         }
         .padding(28).frame(maxWidth: 460, alignment: .leading)

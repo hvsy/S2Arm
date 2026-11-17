@@ -8,6 +8,7 @@ using Ryujinx.HLE.UI;
 using Ryujinx.HLE.UI.Input;
 using Ryujinx.Memory;
 using System;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
@@ -70,6 +71,7 @@ namespace Ryujinx.HLE.HOS.Applets
 
         // S2Arm: how long after the keyboard is shown the host's answer is handed over (both the foreground applet and the inline keyboard)
         private const int AnswerDelayMs = 500;
+        private const int DecidedAfterChangedMs = 150;
 
         // S2Arm: the system text input the host is showing for this keyboard (IAsyncTextInput), null when none;
         // its answer is matched by _headlessAnswer (inline) / _foregroundAnswer, a dismissed or superseded input's late answer is dropped
@@ -142,7 +144,16 @@ namespace Ryujinx.HLE.HOS.Applets
                     else
                     {
                         _keyboardForegroundConfig = ReadStruct<SoftwareKeyboardConfig>(keyboardConfig);
+
+                        // S2Arm: games on the 20.0.0+ keyboard (applet version 0x140010, all Switch 2 games) pass the native config, 0x530 bytes
+                        if (keyboardConfig.Length == NativeConfigSize)
+                        {
+                            ApplyNativeConfig(ref _keyboardForegroundConfig, keyboardConfig);
+                        }
                     }
+
+                    Logger.Info?.Print(LogClass.ServiceAm, $"S2A 软键盘：独立键盘配置 {keyboardConfig.Length:x} 字节（{(keyboardConfig.Length == NativeConfigSize ? "20.0.0 起新布局" : "旧布局")}），" +
+                        $"长度 {_keyboardForegroundConfig.StringLengthMin}–{_keyboardForegroundConfig.StringLengthMax}，UTF-8 {_keyboardForegroundConfig.UseUtf8}，游戏自己校验 {_keyboardForegroundConfig.CheckText}");
 
                     if (!_normalSession.TryPop(out _transferMemory))
                     {
@@ -161,6 +172,29 @@ namespace Ryujinx.HLE.HOS.Applets
                     return ResultCode.Success;
                 }
             }
+        }
+
+        // S2Arm: the 20.0.0+ native keyboard config (protocol facts from public emulator sources; the 0x3AA-byte text prefix keeps the old layout,
+        //   the fields after it moved). Read with the old layout, a Switch 2 game's "validate the text myself" flag (0x48D) was taken from 0x3D0
+        //   (almost always 0): the name went straight back as final while the game waited for its own check — the keyboard looked stuck.
+        //   UTF-8 and the initial text's position were misread the same way
+        internal const int NativeConfigSize = 0x530;
+
+        internal static void ApplyNativeConfig(ref SoftwareKeyboardConfig c, byte[] b)
+        {
+            int I(int o) => BinaryPrimitives.ReadInt32LittleEndian(b.AsSpan(o, 4));
+            c.UseNewLine = b[0x1B] != 0;
+            c.UseUtf8 = b[0x3AA] != 0;
+            c.UseBlurBackground = b[0x3AB] != 0;
+            c.StringLengthMax = I(0x3AC);
+            c.StringLengthMin = I(0x3B0);
+            c.PasswordMode = (PasswordMode)I(0x3B4);
+            c.InputFormMode = (InputFormMode)I(0x3B8);
+            c.InitialStringOffset = I(0x3BC);
+            c.InitialStringLength = I(0x3C0);
+            c.CustomDictionaryOffset = I(0x3C4);
+            c.CustomDictionaryCount = I(0x3C8);
+            c.CheckText = b[0x48D] != 0;
         }
 
         private bool IsKeyboardActive()
@@ -421,11 +455,13 @@ namespace Ryujinx.HLE.HOS.Applets
                         int wordSize = Unsafe.SizeOf<SoftwareKeyboardUserWord>();
                         remaining = stream.Length - stream.Position;
 
-                        if (wordsCount > MaxUserWords)
+                        // 负的词数（审计 P2-255）：同超上限，打警告照常回包；否则乘积为负、过了下面的长度检查，new 负长度数组抛异常、回包前就断
+                        if (wordsCount < 0 || wordsCount > MaxUserWords)
                         {
                             Logger.Warning?.Print(LogClass.ServiceAm, $"Received {wordsCount} User Words but the maximum is {MaxUserWords}");
                         }
-                        else if (wordsCount * wordSize != remaining)
+                        // 游戏常把词表放在定长缓冲里发（怪物猎人 崛起：14 个词、4088 字节），词后面是填充：够装下 wordsCount 个词就收，只拒放不下的
+                        else if (wordsCount * wordSize > remaining)
                         {
                             Logger.Warning?.Print(LogClass.ServiceAm, $"Received invalid Software Keyboard User Word Info data of {remaining} bytes for {wordsCount} words");
                         }
@@ -467,6 +503,11 @@ namespace Ryujinx.HLE.HOS.Applets
                         _keyboardBackgroundDictSet = reader.ReadStruct<SoftwareKeyboardDictSet>();
                     }
 
+                    break;
+                case InlineKeyboardRequest.UnsetCustomizedDictionaries:
+                    // S2Arm: 回专门的 UnsetCustomizedDictionaries 回包（原先落到 default 回 Default：怪物猎人 崛起每次重开键盘前都发，日志报「Invalid request」）
+                    _keyboardBackgroundDictSet = default;
+                    _interactiveSession.Push(InlineResponses.UnsetCustomizedDictionaries(_backgroundState));
                     break;
                 case InlineKeyboardRequest.Calc:
                     // The Calc request is used to communicate configuration changes and commands to the keyboard.
@@ -618,16 +659,35 @@ namespace Ryujinx.HLE.HOS.Applets
         //   as "done": GRID Autosport (iPhone, 11-07) left its name fields at the default / empty with DecidedEnter alone and filled them
         //   once the final text was reported first. The V1 form is sent even when the game asked for V2 (UseChangedStringV2), as the
         //   rest of this applet does (see PushChangedString). Called with _lock held
+        //   The decision then follows DecidedAfterChangedMs later, never in the same batch as the ChangedString: a real keyboard's last
+        //   edit and the Enter press are frames apart, and Monster Hunter Rise (Mac, #279) copies the text into its name field on the
+        //   frame it sees ChangedString — with both in one batch it took DecidedEnter first, kept the field empty and reopened the keyboard
         private void PushHostAnswer(string text, bool ok)
         {
             bool changed = ok && IsKeyboardActive();
-            if (changed)
+            Logger.Info?.Print(LogClass.ServiceAm, $"S2A 软键盘：交回游戏{(ok ? "确定" : "取消")}「{text}」（状态 {_backgroundState}，编码 {(_encoding == Encoding.UTF8 ? "UTF-8" : "UTF-16")}，先报改字 {(changed ? "是" : "否")}）");
+            if (!changed)
             {
-                PushChangedString(text, (uint)text.Length, _backgroundState);
+                PushUpdatedState(text, text.Length, ok ? KeyboardResult.Accept : KeyboardResult.Cancel);
+                return;
             }
 
-            Logger.Info?.Print(LogClass.ServiceAm, $"S2A 软键盘：交回游戏{(ok ? "确定" : "取消")}「{text}」（状态 {_backgroundState}，编码 {(_encoding == Encoding.UTF8 ? "UTF-8" : "UTF-16")}，先报改字 {(changed ? "是" : "否")}）");
-            PushUpdatedState(text, text.Length, ok ? KeyboardResult.Accept : KeyboardResult.Cancel);
+            PushChangedString(text, (uint)text.Length, _backgroundState);
+            _textValue = text;
+            int answer = _headlessAnswer;
+            _ = Task.Delay(DecidedAfterChangedMs).ContinueWith(_ =>
+            {
+                lock (_lock)
+                {
+                    // 这期间游戏关了 / 重开了键盘：这次的确定作废（不往新的一轮里塞旧答案）
+                    if (answer != _headlessAnswer || _backgroundState != InlineKeyboardState.Shown)
+                    {
+                        return;
+                    }
+
+                    PushUpdatedState(text, text.Length, KeyboardResult.Accept);
+                }
+            }, TaskScheduler.Default);
         }
 
         // S2Arm: inline keyboard answered by the host's system text input (IAsyncTextInput). Called with _lock held (Calc)

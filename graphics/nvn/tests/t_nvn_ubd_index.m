@@ -59,12 +59,16 @@ static void add(uint64_t lo, uint64_t hi) {
 }
 static void reset(void) { g_nubd = 0; ubd_flush(); nref = 0; ring_off = 0; }
 static int ref_hits(uint64_t lo, uint64_t hi) { for (int i = 0; i < nref; i++) if (lo < ref[i].hi && ref[i].lo < hi) return 1; return 0; }
+// 参照按定义逐字节判 / 取，只是先和查询区间求交、再在交集里逐字节标记 / 拷贝（11-14：原先每个查询字节扫一遍全部条目、每条条目扫它全部字节，
+//   单测四遍共约 30 秒几乎全花在参照上；结果逐字节相同：盖满 = 交集并起来覆盖 [lo, hi) 每个字节，读出 = 按插入次序后写覆盖先写）
 static int ref_covers(uint64_t lo, uint64_t hi) {
-    for (uint64_t x = lo; x < hi; x++) { int c = 0; for (int i = 0; i < nref && !c; i++) c = ref[i].lo <= x && x < ref[i].hi; if (!c) return 0; }   // 逐字节
+    uint8_t m[2048] = {0}; if (hi - lo > sizeof m) return 0;
+    for (int i = 0; i < nref; i++) { uint64_t a = ref[i].lo > lo ? ref[i].lo : lo, b = ref[i].hi < hi ? ref[i].hi : hi; if (a < b) memset(m + (a - lo), 1, b - a); }
+    for (uint64_t x = 0; x < hi - lo; x++) if (!m[x]) return 0;   // 逐字节
     return 1;
 }
 static void ref_read(uint64_t lo, uint64_t hi, uint8_t *d) {
-    for (int i = 0; i < nref; i++) for (uint64_t x = ref[i].lo; x < ref[i].hi; x++) if (x >= lo && x < hi) d[x - lo] = ring[ref[i].off + (x - ref[i].lo)];
+    for (int i = 0; i < nref; i++) { uint64_t a = ref[i].lo > lo ? ref[i].lo : lo, b = ref[i].hi < hi ? ref[i].hi : hi; if (a < b) memcpy(d + (a - lo), ring + ref[i].off + (a - ref[i].lo), b - a); }
 }
 
 
@@ -267,7 +271,11 @@ int main(void) { @autoreleasepool {
         CHECK(r == 1 && !memcmp(g_wd_cbv[0][5], want8, N8), "⑧ 第一次视图 %d 字节：返回 %d、内容%s同内存 + 更新", N8, r, r == 1 && !memcmp(g_wd_cbv[0][5], want8, N8) ? "" : "不");
         // (a) 两次视图之间没有任何写：影子是缓存里同一份，副本里已是它。指令数扣掉一对 instr() 本身（取最小的一次）
         uint64_t ov = ~0ull; for (int k = 0; k < 16; k++) { uint64_t x = instr(), y = instr(); if (y - x < ov) ov = y - x; }
-        uint64_t i0 = instr(); r = wd_cb_view(0, 5, D, N8); uint64_t ia = instr() - i0 - ov;
+        // 指令数取 8 次里最小的一次（11-10 负载 35–38 时单次读到 1354：线程被抢占 / 缺页的内核指令也记在本线程上；
+        //   无写再看是幂等的，8 次都应返回 2；真去整段再拷的话每一次都 ≥ 2048 条，取最小照样拦得住）
+        uint64_t i0, ia = ~0ull; int r2 = 2;
+        for (int k = 0; k < 8; k++) { i0 = instr(); r = wd_cb_view(0, 5, D, N8); uint64_t x = instr() - i0 - ov; if (x < ia) ia = x; if (r != 2) r2 = r; }
+        r = r2;
         CHECK(r == 2 && !memcmp(g_wd_cbv[0][5], want8, N8), "⑧(a) 无写再看：返回 %d（应 2 = 副本已是这份影子、内容与上次交出逐字节同）、内容%s同", r, !memcmp(g_wd_cbv[0][5], want8, N8) ? "" : "不");
         CHECK(ia < 1000, "⑧(a) 无写再看 %llu 条指令（判据 < 1000：副本已是这份影子不再拷；整段 32 KB 再拷一遍 ≥ 2048 条）", (unsigned long long)ia);
         // (b) 写落在别处（E）：这一段自上一份影子后没有新写，上一份就是答案（同一地址、不另做一份）
@@ -278,7 +286,9 @@ int main(void) { @autoreleasepool {
         CHECK(mb == 0 && c2 == c && g2 == g, "⑧(b) 别处写后再取：新做影子 %llu 份（应 0）、%s", (unsigned long long)mb, c2 == c ? "同一份" : "换了一份（整段重拷）");
         // (c) 同 (b) 但经宽屏视图：既不另做影子、也不再拷进副本
         mtl_sub_update(u2, E + 4096, 16);
-        m0 = g_ubp_made; i0 = instr(); r = wd_cb_view(0, 5, D, N8); uint64_t ic = instr() - i0 - ov;
+        m0 = g_ubp_made; uint64_t ic = ~0ull; r2 = 2;   // 同 (a)：取 8 次里最小的指令数，每次都应返回 2、不新做影子
+        for (int k = 0; k < 8; k++) { i0 = instr(); r = wd_cb_view(0, 5, D, N8); uint64_t x = instr() - i0 - ov; if (x < ic) ic = x; if (r != 2) r2 = r; }
+        r = r2;
         CHECK(r == 2 && !memcmp(g_wd_cbv[0][5], want8, N8) && g_ubp_made == m0 && ic < 1000, "⑧(c) 别处写后视图：返回 %d（应 2）、内容%s同、新做影子 %llu 份（应 0）、%llu 条指令（判据 < 1000）",
               r, !memcmp(g_wd_cbv[0][5], want8, N8) ? "" : "不", (unsigned long long)(g_ubp_made - m0), (unsigned long long)ic);
         // (d) 这一段有新写：照常续拼一份，副本跟着换
@@ -354,6 +364,17 @@ int main(void) { @autoreleasepool {
         CHECK(g_e9_per < 4.5, "⑨ 宽屏一遍每笔 tex_mtl %.2f 次（判据 < 4.5：颜色目标 0 的尺寸在放宽画法下取一次；改前每笔多取一次、约 5.06）", g_e9_per);
         printf("%s ⑨ 宽屏一遍（2346×1080 目标、64 笔）：每笔 tex_mtl %.2f 次（共 %llu）、读回整张存储指纹 %016llx（改前同一单测编出应同）\n", bad > bad9 ? "✗" : "✓", g_e9_per,
                (unsigned long long)g_e9_tex, (unsigned long long)g_e9_hash); }
+    {   // ⑬ #640：一次提交里同一页排了很多条内联更新时，每次查常量块都把整条链走完（每次绘制一遍，链越积越长，一帧数秒）：超过 PEND_SINCE_MAX 回 -1（不做影子、结束渲染遍），没超照常全收。
+        //    期望按语义手写：100 条全在 [P, P+256) 里 → 回 100；20000 条（> 8192）→ 回 -1（修前回 20000），查一次 < 5 ms
+        int bad11 = bad; uint64_t P = 0x7f0000100000ull;
+        pend_reset(); for (int i = 0; i < 100; i++) pend_add(P + (uint64_t)(i % 16) * 16, 16, 1);
+        int n100 = pend_since(P, P + 256, 0, g_ubp_idx);
+        CHECK(n100 == 100, "⑬ 同页 100 条：pend_since 回 %d（应 100）", n100);
+        pend_reset(); for (int i = 0; i < 20000; i++) pend_add(P + (uint64_t)(i % 16) * 16, 16, 1);
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int nbig = pend_since(P, P + 256, 0, g_ubp_idx); uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        CHECK(nbig == -1 && dt < 5000000ull, "⑬ 同页 20000 条：pend_since 回 %d（应 -1）、用时 %.3f ms（应 < 5 ms）", nbig, dt / 1e6);
+        pend_reset();
+        printf("%s ⑬ 同页 100 条回 %d、20000 条回 %d（%.3f ms）\n", bad > bad11 ? "✗" : "✓", n100, nbig, dt / 1e6); }
     printf("%s t_nvn_ubd_index：%s\n", bad ? "✗" : "✓", bad ? "有不符" : "延后表查找同参照、512 条下单次查找低于 400 条指令");
     return bad != 0;
 } }

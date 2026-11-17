@@ -14,6 +14,7 @@
 #ifndef S2A_HAPTIC_RETRY_H
 #define S2A_HAPTIC_RETRY_H
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -65,6 +66,33 @@ static inline void s2a_hp_rearm(s2a_hp_state *state) {
     state->fails = 0;
     state->retry_at_ns = 0;
     state->disabled = false;
+}
+
+// 游戏振幅 → 系统手柄震动强度（Mac 宿主 macos/front_mac.m 用）。游戏给的是线性马达（HD 震动）的振幅，常见值很小；
+//   系统手柄多是转子马达，按原值当强度几乎感觉不到（11-10 M1 Max / DualSense / 程序号 0400486024DEC000：游戏每秒给 0.002–0.191，
+//   0.19 按 0.19 播没感觉，同一只手柄强度 1 明显）。小振幅抬高、单调不减、封顶 1：1.25·sqrt(a)·(3 − 2·a^0.15)，
+//   0.064 → 0.53、0.191 → 0.79，a ≥ 0.45 起为 1。系数 1.25 是同一玩家同一场景试 0.63 / 0.79 两档后取的。
+static inline float s2a_hp_feel(float amplitude) {
+    if (!(amplitude > 0)) return 0;
+    float v = 1.25f * sqrtf(amplitude) * (3 - 2 * powf(amplitude, 0.15f));
+    return v < 1 ? v : 1;
+}
+
+// 震动分左右马达（11-16）：游戏给的是左右两侧 HD 震动（s2a_pad_vibration[2]：[0] 左、[1] 右）。
+//   手柄的 GCDeviceHaptics 同时支持 LeftHandle / RightHandle 两个 locality（Xbox / DualSense / DualShock 等双转子马达）时，
+//   左右各建一个引擎、各播各的；只有 Default 的（单马达 / 系统不报分侧）照旧两侧合成一路。返回 true = 分两路
+static inline bool s2a_hp_split(bool has_left_handle, bool has_right_handle) { return has_left_handle && has_right_handle; }
+// n 侧（1 = 单侧，2 = 左右合成）的低 / 高频振幅与频率 → 一路的强度与锐度（合成算法与之前三处一致：强度取最大振幅，
+//   频率按振幅加权平均后映射到锐度 0–1，160 Hz 处 0.3，每高 160 Hz 加 0.5）。强度是原始振幅，手感曲线与档位倍率由调用方再乘
+static inline void s2a_hp_mix(int n, const float lo_amp[], const float hi_amp[], const float lo_hz[], const float hi_hz[], float *amplitude, float *sharpness) {
+    float amp = 0, weighted = 0, weights = 0;
+    for (int i = 0; i < n; i++) {
+        float lo = isfinite(lo_amp[i]) ? fminf(1, fmaxf(0, lo_amp[i])) : 0, hi = isfinite(hi_amp[i]) ? fminf(1, fmaxf(0, hi_amp[i])) : 0;
+        float lh = isfinite(lo_hz[i]) ? fminf(1250, fmaxf(0, lo_hz[i])) : 0, hh = isfinite(hi_hz[i]) ? fminf(1250, fmaxf(0, hi_hz[i])) : 0;
+        amp = fmaxf(amp, fmaxf(lo, hi)); weighted += lo * lh + hi * hh; weights += lo + hi;
+    }
+    float hz = weights > 0 ? weighted / weights : 160, sh = (hz - 160) / 160 * 0.5f + 0.3f;
+    *amplitude = amp; *sharpness = isfinite(sh) ? fminf(1, fmaxf(0, sh)) : 0.3f;
 }
 
 #endif

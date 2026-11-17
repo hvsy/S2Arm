@@ -5,7 +5,7 @@
 #      旁边各有 .synth；字体、时区照在
 #   ② 玩家目录（S2A_SYSDATA）给了真的 0802 → 换成真的（逐字节同来源）、0802.synth 去掉；0823 仍是合成的
 #   ③ 再跑 → 跳过、现行不动；③b 玩家目录的 0802 换了内容（同名同大小）→ 换成新的，换完再跑跳过（审计 #1534 P1-54）
-#   ④ 玩家目录里 0802 是空目录 → 不认，照样用合成的
+#   ④ 玩家目录里 0802 是空目录 → 不认，照样用合成的；④b 只有 ._ / .DS_Store 同空目录；③c 只有 ._ 附属文件变了 → 再跑照旧跳过
 #   ⑤ 玩家目录有 0801（没有合成器的号）→ 拷进；没有 0801 → 不提供、不报红
 #   ⑥ 产物根里已有真的 0823 → 留着，不换成合成的
 #   ⑦ 需求表不参与判断：S2A_SYSDATA_NEED 指向一张「本构建不要任何系统数据」的表 → 照样提供 0802 / 0823
@@ -29,6 +29,7 @@ n() { ls "$(c "$1")/systemdata/$2" 2> /dev/null | wc -l | tr -d ' '; }
 mk g 0100AAAA00000000 11223344
 o=$(S g 2>&1); r=$?
 ck "① 表外的款、两处都没有 → 不报红黄（rc=${r}）、合成 0802 $(n g 0100000000000802) 个 / 0823 $(n g 0100000000000823) 个文件、各带 .synth" '[ $r = 0 ] && [[ "$o" != *【红】* ]] && [[ "$o" != *【黄】* ]] && [ "$(n g 0100000000000802)" = 6 ] && [ "$(n g 0100000000000823)" = 98 ] && [ -f "$(c g)/systemdata/0100000000000802.synth" ] && [ -f "$(c g)/systemdata/0100000000000823.synth" ]'
+ck "① 合成 Switch 2 Mii 资源 0849 $(n g 0400000000000849) 个文件、带 .synth" '[ "$(n g 0400000000000849)" = 12 ] && [ -f "$(c g)/systemdata/0400000000000849.synth" ]'
 ck "① 合成的 0802 解析器读一遍通过；字体、时区照在" 'python3 $T/repo/pack/sysdata_mii.py check "$(c g)/systemdata/0100000000000802" > /dev/null && [ -f "$(c g)/systemdata/fonts/a.bfttf" ] && [ -f "$(c g)/systemdata/010000000000080E/binaryList.txt" ]'
 o=$(S2A_SYSDATA=$T/sd S g 2>&1); r=$?
 ck "② 玩家给了真的 0802 → 换成真的、去掉 .synth；0823 仍合成（rc=${r}）" '[ $r = 0 ] && [ "$(cat "$(c g)/systemdata/0100000000000802/ShapeHigh.dat")" = real ] && [ ! -e "$(c g)/systemdata/0100000000000802.synth" ] && [ -f "$(c g)/systemdata/0100000000000823.synth" ]'
@@ -40,10 +41,19 @@ printf 'REAL' > $T/sd/0100000000000802/ShapeHigh.dat; b=$(c g); o=$(S2A_SYSDATA=
 ck "③b 玩家目录 0802 内容换了 → 产物根换成新的、现行换版本（rc=${r}）" '[ $r = 0 ] && [ "$(c g)" != "$b" ] && [ "$(cat "$(c g)/systemdata/0100000000000802/ShapeHigh.dat")" = REAL ]'
 b=$(c g); o=$(S2A_SYSDATA=$T/sd S g 2>&1); r=$?
 ck "③b 换完再跑 → 跳过、现行不动（rc=${r}）" '[ $r = 0 ] && [ "$(c g)" = "$b" ] && [[ "$o" == *跳过* ]]'
+# ③c exFAT / FAT 上 macOS 在旁边放 ._<名>（存扩展属性，内容随属性变）、访达写 .DS_Store：不是系统数据，变了也不算玩家目录换了 → 再跑照旧跳过
+printf 'x1' > $T/sd/0100000000000802/._ShapeHigh.dat; : > $T/sd/0100000000000802/.DS_Store; S2A_SYSDATA=$T/sd S g > /dev/null 2>&1
+printf 'x2' > $T/sd/0100000000000802/._ShapeHigh.dat; b=$(c g); o=$(S2A_SYSDATA=$T/sd S g 2>&1); r=$?
+ck "③c 玩家目录里只有 ._ 附属文件变了 → 跳过、现行不动（rc=${r}）" '[ $r = 0 ] && [ "$(c g)" = "$b" ] && [[ "$o" == *跳过* ]]'
 mk e 0100EEEE00000000 22222222
 o=$(S2A_SYSDATA=$T/sd_empty S e 2>&1); r=$?
 ck "④ 玩家目录里 0802 是空目录 → 不认、用合成的（rc=${r}）" '[ $r = 0 ] && [ -f "$(c e)/systemdata/0100000000000802.synth" ] && [ "$(n e 0100000000000802)" = 6 ]'
 ck "⑤ 没有 0801 → 不提供、不报红" '[ ! -e "$(c e)/systemdata/0100000000000801" ] && [[ "$o" != *【红】* ]]'
+# ④b 玩家目录 0802 里只有系统附属文件（._ShapeHigh.dat、.DS_Store）→ 同空目录，不认、用合成的
+mkdir -p $T/sd_junk/0100000000000802; printf 'x' > $T/sd_junk/0100000000000802/._ShapeHigh.dat; : > $T/sd_junk/0100000000000802/.DS_Store
+mk j 0100DDDD00000000 44444444
+o=$(S2A_SYSDATA=$T/sd_junk S j 2>&1); r=$?
+ck "④b 玩家目录 0802 只有 ._ / .DS_Store → 不认、用合成的（rc=${r}）" '[ $r = 0 ] && [ -f "$(c j)/systemdata/0100000000000802.synth" ] && [ "$(n j 0100000000000802)" = 6 ]'
 mk k 0100FFFF00000000 33333333; mkdir -p $T/roots/k@s0/systemdata/0100000000000823; echo real > $T/roots/k@s0/systemdata/0100000000000823/real.dat
 o=$(S k 2>&1); r=$?
 ck "⑥ 产物根已有真的 0823 → 留着、不换成合成的（rc=${r}）" '[ $r = 0 ] && [ "$(cat "$(c k)/systemdata/0100000000000823/real.dat")" = real ] && [ ! -e "$(c k)/systemdata/0100000000000823.synth" ] && [ "$(n k 0100000000000823)" = 1 ]'
@@ -68,4 +78,46 @@ ck "⑨ 戳过期 → 跑生成器现做、换进位、戳 = 生成器哈希（r
 echo stale > $T/of/.generator.sha256; mk fa 0100FAFA00000000 66666666
 o=$(F0 S2A_PYTHON=false bash $T/repo/pack/stage_sysdata.sh fa 2>&1); r=$?
 ck "⑩ 戳过期且生成器失败 → 报红、退非 0、不留临时目录（rc=${r}）" '[ $r != 0 ] && [[ "$o" == *【红】*开源替代字体* ]] && ! ls -d $T/of.tmp.* > /dev/null 2>&1'
+# ⑪ 拷字体失败要报原因（审计：玩家只见「拷字体失败」）：PATH 前插假 cp，只对拷进 systemdata/fonts/ 的那次动手脚，其余照真 cp
+#   ⑪a 克隆复制（-c）报 clonefile failed: Cross-device link（#290 原文：旧 macOS 字体源与库不同卷）、普通复制能成 → 退 0、字体在、黄行带第一次的原因
+#   ⑪b 两次都报 Permission denied → 退非 0、红行「拷字体失败：」后带两次 cp 的原文
+mkdir -p $T/fakecp; printf '#!/bin/bash\nfor a in "$@"; do last=$a; done\ncase "$last" in */systemdata/fonts/) case "$1:$FAKECP" in -c:*) echo "cp: $2: clonefile failed: Cross-device link" >&2; exit 1 ;; *:both) echo "cp: $last: Permission denied" >&2; exit 1 ;; esac ;; esac\nexec /bin/cp "$@"\n' > $T/fakecp/cp; chmod +x $T/fakecp/cp
+if [ "$(uname -s)" = Darwin ]; then
+  mk fc 0100FCFC00000000 77777777
+  o=$(PATH=$T/fakecp:$PATH FAKECP=clone S fc 2>&1); r=$?
+  ck "⑪a 克隆复制失败、普通复制成 → 退 0、字体在、黄行带原因（rc=${r}）" '[ $r = 0 ] && [ -f "$(c fc)/systemdata/fonts/a.bfttf" ] && [[ "$o" == *【黄】*克隆复制失败*"Cross-device link"* ]]'
+  mk fd 0100FDFD00000000 88888888
+  o=$(PATH=$T/fakecp:$PATH FAKECP=both S fd 2>&1); r=$?
+  ck "⑪b 两次都失败 → 退非 0、红行带两次原因（rc=${r}）" '[ $r != 0 ] && [[ "$o" == *"【红】拷字体失败："*"Cross-device link"*"普通复制："*"Permission denied"* ]]'
+fi
+# ⑫ 只模拟 cp 失败。递归克隆可能先留下半份目标目录，普通复制必须写到正确层级。
+if [ "$(uname -s)" = Darwin ]; then
+  mkdir -p "$T/fakesd" "$T/source with space/0100000000000801/subdir"
+  sd_source="$T/source with space"
+  printf 'cross-volume' > "$sd_source/0100000000000801/subdir/sample.dat"
+  cat > "$T/fakesd/cp" <<'EOF'
+#!/bin/bash
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  */systemdata/0100000000000801)
+    if [ "$1" = -c ]; then
+      mkdir -p "$last" && printf 'partial' > "$last/clone-leftover"
+      printf 'cp: clonefile failed: %s\n' "${TEST_SYSDATA_CLONE_ERR:-Cross-device link}" >&2
+      exit 1
+    fi
+    if [ "${TEST_SYSDATA_DENY:-0}" = 1 ]; then printf 'cp: Permission denied\n' >&2; exit 1; fi ;;
+esac
+exec /bin/cp "$@"
+EOF
+  chmod +x "$T/fakesd/cp"
+  mk sd 0100DADA00000000 99999999
+  o=$(PATH=$T/fakesd:$PATH S2A_SYSDATA="$sd_source" S sd 2>&1); r=$?
+  ck "⑫a 目录克隆跨卷失败 → 清理半份目标、普通复制成功、黄行带原因（rc=${r}）" '[ $r = 0 ] && cmp -s "$(c sd)/systemdata/0100000000000801/subdir/sample.dat" "$sd_source/0100000000000801/subdir/sample.dat" && [ ! -e "$(c sd)/systemdata/0100000000000801/clone-leftover" ] && [[ "$o" == *【黄】*克隆复制失败*"Cross-device link"* ]]'
+  mk sf 0100DADA00000001 aaaaaaaa
+  b=$(c sf); o=$(PATH=$T/fakesd:$PATH S2A_SYSDATA="$sd_source" TEST_SYSDATA_DENY=1 S sf 2>&1); r=$?
+  ck "⑫b 两次复制都失败 → 保留两次错误、现行不动（rc=${r}）" '[ $r != 0 ] && [[ "$o" == *【红】*拷系统数据*"Cross-device link"*"普通复制："*"Permission denied"* ]] && [ "$(c sf)" = "$b" ]'
+  mk sg 0100DADA00000002 bbbbbbbb
+  o=$(PATH=$T/fakesd:$PATH S2A_SYSDATA="$sd_source" TEST_SYSDATA_CLONE_ERR='Operation not supported' S sg 2>&1); r=$?
+  ck "⑫c 同卷不支持克隆 → 仍可普通复制、黄行带原因（rc=${r}）" '[ $r = 0 ] && cmp -s "$(c sg)/systemdata/0100000000000801/subdir/sample.dat" "$sd_source/0100000000000801/subdir/sample.dat" && [[ "$o" == *【黄】*克隆复制失败*"Operation not supported"* ]]'
+fi
 chmod -R u+w $T; rm -rf $T; [ $bad = 0 ] && echo "stage_sysdata 单测全过" || { echo "stage_sysdata 单测有不通"; exit 1; }

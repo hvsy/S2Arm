@@ -14,15 +14,18 @@ ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
 mkdir -p $T/repo/pack $T/roots/acnh@v1/ctl; cp "$H/pack/refresh.sh" "$H/pack/roots.sh" $T/repo/pack/; mkdir -p $T/repo/tools; cp "$H/tools/toolchain.sh" "$H/tools/toolchain.env" "$H/tools/cores.sh" "$H/tools/progress.sh" "$H/tools/plock.sh" "$H/tools/flock_hold.py" "$H/tools/mem_admit.sh" "$H/tools/mem_peak.tsv" "$H/tools/mem_peak_sample.py" $T/repo/tools/; export S2A_MEM_DIR=$T/mem; export S2A_DISK_FREE_G=999 S2A_REFRESH_LOCKS=$T/locks S2A_RUN_ROOT=$T/run; touch $T/roots/acnh@v1/ctl/control.nacp; ln -s acnh@v1 $T/roots/acnh@现行
 mkdir -p $T/repo/translator; printf 'import os\nprint(os.environ.get("FAKE_GLSLC", "no"))\n' > $T/repo/translator/glslc_offline.py   # 运行时 GLSLC 款判据桩（⑬c）
 cp "$H/pack/decoder_need.sh" $T/repo/pack/; mkdir -p $T/repo/graphics/nvn/tools; cp "$H/graphics/nvn/tools/romfs_list.py" $T/repo/graphics/nvn/tools/   # 解码器款判据（⑬e）：真判据读假根 RomFS
+mkdir -p "$T/repo/tools"; cp "$H/tools/pool_workers.py" "$T/repo/tools/"   # romfs_list / pak_crypto 经它取核数（#1332：核数唯一来源）
 printf '#!/bin/bash\necho "原件核对桩 rc=${FAKE_SRCVER_RC:-0}"; exit ${FAKE_SRCVER_RC:-0}\n' > $T/repo/pack/srcver.sh   # 原件版本核对桩（pack/srcver.sh 自己的单测见 tests/srcver_test.sh）
 # 桩：记「阶段 起/止 时刻 开关」；stage_direct 按 FAKE_NODIRECT 决定出不出 keys.tsv；FAKE_FAIL=<阶段> 让那段退出 1（基础设施出错）；
 #   FAKE_GAP=<阶段> 让那段打「【黄】直连缺口：桩缺口 3 支」退出 3（内容缺口）；FAKE_DFAIL=<阶段> 让那段打「【红】直连库失败：…」退出 3（抽取：只有直连用的那两份抽不出）
 for s in rewrite sysdata uilayout aoc caps romfsidx direct_profile extract direct_seed direct; do
   cat > $T/repo/pack/stage_$s.sh <<EOF
 #!/bin/bash
-echo "$s 起 \$(python3 -c 'import time;print(time.time())') \${S2A_SHADER_NO_PSO:-0}\${S2A_SHADER_NO_DL:-0} J=\${J:-无} DD=\${DEVELOPER_DIR:-无} LZ=\${S2A_SHADER_LAZY:-0}" >> $T/log
+echo "$s 起 \$(python3 -c 'import time;print(time.time())') \${S2A_SHADER_NO_PSO:-0}\${S2A_SHADER_NO_DL:-0} J=\${J:-无} DD=\${DEVELOPER_DIR:-无} LZ=\${S2A_SHADER_LAZY:-0} BK=\${S2A_CPU_BAKE:-无}" >> $T/log
 [ "$s" = direct ] && sleep \${FAKE_DIRECT_SLEEP:-1}
 [ "$s" = rewrite ] && sleep \${FAKE_RW_SLEEP:-0}
+# FAKE_RW_UNTIL=<阶段>：改写等那个阶段在日志里记下「起」才结束（最多 30 秒）——按事件判并行，不靠墙钟窗口（⑬a：满载时直连库可能晚于固定的 2 秒才起）
+if [ "$s" = rewrite ] && [ -n "\${FAKE_RW_UNTIL:-}" ]; then for i in \$(seq 600); do grep -q "^\$FAKE_RW_UNTIL 起 " $T/log && break; sleep 0.05; done; fi
 if [ "$s" = direct ]; then d=\$(cd -P $T/roots/acnh@现行 && pwd)/shaders/direct; rm -rf "\$d"; if [ -n "\${FAKE_RTONLY:-}" ]; then mkdir -p "\$d" && : > "\$d/keys.tsv" && echo 缺口 > "\$d/runtime_only.txt"; elif [ -n "\${FAKE_VKHDR:-}" ]; then mkdir -p "\$d/vk" && : > "\$d/keys.tsv" && printf "# key\tfile\n" > "\$d/vk/vk_shaders.tsv"; else [ -n "\${FAKE_NODIRECT:-}" ] || { mkdir -p "\$d" && echo k > "\$d/keys.tsv"; }; fi; fi
 echo "$s 止 \$(python3 -c 'import time;print(time.time())')" >> $T/log
 [ "\${FAKE_FAIL:-}" = "$s" ] && { echo "🔴 $s 桩失败"; exit 1; }
@@ -42,6 +45,10 @@ ck "① 退出时一行分阶段用时，各段都在（缺：${miss:-无}）、
 jj() { grep ' 起 ' $T/log | awk -v s="$1" '$1 == s { sub("J=", "", $5); print $5; exit }'; }
 o=$(J=18 R); r=$?
 ck "① 调用方给 J=18 → 直连 J=$(jj direct) 开满" '[ $r = 0 ] && [ "$(jj direct)" = 18 ]'
+# #711：直连库段只拿编译路数 J（S2A_DIRECT_J），S2A_CPU_BAKE 保留按内存算的值给段里的抽取封顶（原先两个都设成 J，抽取跟着开到编译路数）
+bk() { grep ' 起 ' $T/log | awk -v s="$1" '$1 == s { for (i = 1; i <= NF; i++) if ($i ~ /^BK=/) { sub("BK=", "", $i); print $i; exit } }'; }
+o=$(S2A_DIRECT_J=7 S2A_CPU_BAKE=3 R); r=$?
+ck "① S2A_DIRECT_J=7、S2A_CPU_BAKE=3 → 直连 J=$(jj direct)、S2A_CPU_BAKE=$(bk direct)（期望 7 / 3）" '[ $r = 0 ] && [ "$(jj direct)" = 7 ] && [ "$(bk direct)" = 3 ]'
 # 阶段进度（10-25 维护者「能看到进度么」）：给 S2A_PROGRESS → 每完成一段追加一行「刷新各阶段 已完成 总数」
 o=$(S2A_PROGRESS=$T/prog R); r=$?; pg=$(cut -f3,4 $T/prog | tr '\t\n' '/ '); rm -f $T/prog
 #   11-06 依赖重排（快路）：追加内容 ‖ 界面布局 2 → 配置推导 + 抽取 4 → 直连库 5 → 种子表 6 → 汇合旁路（改写 / 系统数据 / 能力表 / RomFS 索引）10
@@ -92,14 +99,14 @@ ATE() { cat > $T/repo/pack/targets/android/target.json <<EOF
 EOF
 }
 ATE false
-o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
+o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | LC_ALL=C sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
 ck "⑫ Android enabled=false：跑系统数据 / 追加内容 / 能力清单 / 索引，抽取与直连库 skipped、不跑，rc=${r}，阶段 ${ran}，进度 ${pg}" \
   '[ $r = 0 ] && [ "$ran" = "aoc caps romfsidx sysdata " ] && [ "$pg" = "2/6 3/6 4/6 5/6 6/6 " ] && grep -q "^extract skipped（安卓运行时未读 LibPack，#1434 接上后恢复）$" <<< "$o" && grep -q "^direct skipped（安卓运行时未读 LibPack，#1434 接上后恢复）$" <<< "$o" && ! grep -q "^extract " $T/log && ! grep -q "^direct " $T/log'
 ck "⑫ Android enabled=false：末行带 skipped 黄项（一键出包的 result warnings 从这行取，rc=${r}）" \
   'grep -q "^🟢 acnh Android 共享资源已刷新：.*；🟡 1 项：离线 Vulkan 直连库 skipped（安卓运行时未读 LibPack，#1434 接上后恢复）$" <<< "$o"'
 ck "⑫ Android enabled=false：⏱ 分阶段用时里 extract / direct 记 0 秒" '[[ "$(grep "^⏱" <<< "$o")" =~ extract\ 0\ .*direct\ 0 ]]'
 ATE true
-o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
+o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | LC_ALL=C sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
 ck "⑪ Android enabled=true：系统数据、追加内容、能力清单、索引、抽取、直连库，rc=${r}，阶段 ${ran}，进度 ${pg}" '[ $r = 0 ] && [ "$ran" = "aoc caps direct extract romfsidx sysdata " ] && [ "$pg" = "2/6 3/6 4/6 5/6 6/6 " ]'
 ck "⑪ Android 抽取在 RomFS 索引之后、直连库在抽取之后，各跑一次" 'python3 -c "import sys; e,i,d,x=map(float,sys.argv[1:]); sys.exit(0 if e >= i and d >= x else 1)" $(t extract 起) $(t romfsidx 止) $(t direct 起) $(t extract 止) && [ "$(grep -c "^extract 起" $T/log)" = 1 ] && [ "$(grep -c "^direct 起" $T/log)" = 1 ]'
 for stage in sysdata aoc caps romfsidx; do
@@ -119,8 +126,8 @@ o=$(S2A_PACK_PLAT=android FAKE_DFAIL=extract R); r=$?
 ck "⑪ Android 抽取只坏直连那两份（退 3）→ 打黄带原因、不跑直连库（rc=${r}）" '[ $r = 0 ] && [[ "$(ar)" == *"；🟡 1 项：安卓直连库没出（extract rc=3：acnh 直连库失败：直连抽取失败（桩：Unity 无类型树）；运行时现编）" ]] && ! grep -q "^direct 起" $T/log'
 # ⑬ 依赖重排（11-06 出包速度线，快路）：直连链不等改写那一组；期望按依赖手写（桩记起 / 止时刻）
 lt() { python3 -c "import sys; a,b=map(float,sys.argv[1:]); sys.exit(0 if a < b else 1)" "$1" "$2"; }
-o=$(FAKE_RW_SLEEP=2 R); r=$?
-ck "⑬a 改写睡 2 秒：直连库在改写结束前已开工（rc=${r}）" '[ $r = 0 ] && lt $(t direct 起) $(t rewrite 止)'
+o=$(FAKE_RW_UNTIL=direct R); r=$?
+ck "⑬a 改写等直连库开工才结束：直连库在改写结束前已开工（rc=${r}；直连库若排在改写之后，改写等满 30 秒才止，这条红）" '[ $r = 0 ] && lt $(t direct 起) $(t rewrite 止)'
 ck "⑬a 能力表在改写之后；抽取 / RomFS 索引在界面布局之后；抽取在追加内容与配置推导之后" '! lt $(t caps 起) $(t rewrite 止) && ! lt $(t extract 起) $(t uilayout 止) && ! lt $(t romfsidx 起) $(t uilayout 止) && ! lt $(t extract 起) $(t aoc 止) && ! lt $(t extract 起) $(t direct_profile 止)'
 # ⑬e（见下）解码器款同样等改写
 # ⑬d 运行时 GLSLC 款（11-07 gridfix 新私有根）：抽取要改写后的模块 → 改写睡 2 秒时抽取在改写结束之后才开工；改写红 → 退 1、不跑抽取 / 直连库
@@ -137,6 +144,11 @@ mkdir -p "$(cd -P $T/roots/acnh@现行 && pwd)/romfs/base" && : > "$(cd -P $T/ro
 o=$(FAKE_FAIL=rewrite R); r=$?
 ck "⑬e 解码器款改写红 → 退 1、抽取与直连库都没跑（rc=${r}）" '[ $r = 1 ] && ! grep -q "^extract 起\|^direct 起" $T/log'
 rm -f "$(cd -P $T/roots/acnh@现行 && pwd)/romfs/base/gameresources.resources"
+# ⑬f Trinity 包（#470 0100F43008C44000：arc/data.trpfs，Oodle）同样是解码器款：抽取等改写结束才开工（原先不在名单里，抽取抢在改写前、离线 0 支）
+mkdir -p "$(cd -P $T/roots/acnh@现行 && pwd)/romfs/arc" && : > "$(cd -P $T/roots/acnh@现行 && pwd)/romfs/arc/data.trpfs"
+o=$(FAKE_RW_SLEEP=2 R); r=$?
+ck "⑬f 解码器款（.trpfs）：抽取等改写结束才开工（rc=${r}）" '[ $r = 0 ] && ! lt $(t extract 起) $(t rewrite 止)'
+rm -f "$(cd -P $T/roots/acnh@现行 && pwd)/romfs/arc/data.trpfs"
 o=$(FAKE_FAIL=rewrite R); r=$?
 ck "⑬b 改写红 → rc=${r}（期望 1）、红行点名 rewrite、不跑能力表" '[ $r = 1 ] && grep -q "刷新停在 rewrite 阶段" <<< "$o" && [ -z "$(t caps 起)" ]'
 o=$(FAKE_FAIL=romfsidx R); r=$?

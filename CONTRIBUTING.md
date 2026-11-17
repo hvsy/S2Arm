@@ -24,7 +24,7 @@ bash tools/doctor.sh
 
 | 工具 | 版本与配置来源 |
 | --- | --- |
-| Xcode | 统一使用 Xcode 27.1，路径和部署目标见 [tools/toolchain.env](tools/toolchain.env) |
+| Xcode | 使用本机已安装的 Xcode，不限定固定版本；选择规则及 iOS SDK / Metal 能力检查见 [tools/toolchain.sh](tools/toolchain.sh)，部署目标见 [tools/toolchain.env](tools/toolchain.env) |
 | .NET SDK | 微软官方 .NET 10 SDK，具体版本与滚动策略见 [global.json](compat/tree/global.json)；Homebrew 源码构建版的 NativeAOT 链接限制见环境检查输出 |
 | Python | 3.12 或更新版本；改写器依赖见 [tools/rewriter-requirements.txt](tools/rewriter-requirements.txt) |
 | bash | 5 或更新版本；macOS 自带的 bash 3.2 不满足开发检查要求 |
@@ -88,8 +88,8 @@ Copyright 2026 S2Arm contributors
 | `services/` | `bash services/gate.sh`；改了跨平台接缝还需 `bash tests/platform_scan_test.sh` |
 | `pack/` | `python3 pack/jobs/applenv.py` + `make test`（pack 相关单测） |
 | `launchers/` | `python3 launchers/macos/prepare_build.py` + `build/venv/bin/python3 launchers/macos/build_app.py` |
-| `android/` | `bash android/build.sh check` |
-| `docs/` 或 `*.md` | `python3 tools/check_links.py .` + `python3 tests/docs_consistency_test.py` |
+| `android/` | `bash android/test.sh`（无设备 CPU 测，见 [安卓平台文档](android/README.md)）；Linux 上另跑 `bash android/linux_ctest.sh` |
+| `docs/` 或 `*.md` | `python3 tests/docs_consistency_test.py`；本地链接可用 `make lint` 自查（自愿工具，见下文「验证改动」） |
 | 任意改动 | `bash tools/contrib_check.sh --base origin/main`（一级自检，提 PR 必跑） |
 
 Linux 暂不支持。跑不了的步骤写清原因和未测范围，不省略。
@@ -130,8 +130,8 @@ make lint             # 静态问题、文档链接与日志事件设计
 
 <!-- S2ARM_POLICY:BEGIN -->
 以下内容由 `python3 tools/docs_consistency.py --render` 从实际脚本生成；修改后用同一工具核对。
-- 批上限：快档 `TRAIN_BATCH_MAX` 缺省 10 支；full 档 `TRAIN_FULL_MAX` 缺省 5 支。
-- 红批归责：先按红行/红步定位并隔离相关支；无关支只继承输入未变的检查结论。相关支多于 `TRAIN_BISECT_MIN`（缺省 2）时，实际 `seqchk` 会对半分批，只核红步及两半共路由的步骤；并行深度低于 `TRAIN_PAR_DEPTH`（缺省 2）时两半同时跑，到上限后先后跑；不满足分批条件时逐支核。路由不明则跑整份门禁。
+- 批上限：快档 `TRAIN_BATCH_MAX` 缺省 10 支；full 档 `TRAIN_FULL_MAX` 缺省 10 支。
+- 红批归责：先按红行/红步定位并隔离相关支；无关支只继承输入未变的检查结论。相关支多于 `TRAIN_BISECT_MIN`（缺省 1）时，实际 `seqchk` 会对半分批，只核红步及两半共路由的步骤；并行深度低于 `TRAIN_PAR_DEPTH`（缺省 2）时两半同时跑，到上限后先后跑；不满足分批条件时逐支核。路由不明则跑整份门禁。
 - 自检退出码：`0` 第一层本机已证通过（待宿主/第二层仍单列）；`1` 有红；`2` 不完整或参数/基线错误；`75` 环境未就绪；`130` 被中断。
 <!-- S2ARM_POLICY:END -->
 

@@ -3,7 +3,7 @@
 启动器下载后逐文件核 SHA-256、按壳编号与游戏包对号。
 
 清单 = 产物契约 s2a.artifact.v2（pack/contracts/artifact.v2.schema.json），target = ios-shell，details 子格式 s2a.artifact.shell.v2：
-  shellId     壳编号 = sha256("s2a.shell.v2\\0" + inputs + "\\0" + chain + "\\0" + iosMin) 前 16 位十六进制；游戏包写它要哪一版壳，
+  shellId     壳编号 = sha256("s2a.shell.v2\\0" + inputs + "\\0" + chain + "\\0" + iosMin + "\\0" + iosSdk) 前 16 位十六进制；游戏包写它要哪一版壳，
               出包和启动时与本地壳清单的 shellId 逐字相同才放行（不同就报红，换链号后头文件没跟上那类错配不再能装上）
   inputs      壳构建输入的指纹（维护者 11-04：壳编号 = 壳的构建输入，不再绑整份源码提交）= 输入表 pack/stage_inputs/shell.tsv 里「入」的文件 / 目录
               在 HEAD 上的对象号（同阶段键 pack/stage_keyfiles.sh stage_files_key）；表由出壳时实际读到的文件核（pack/shell/closure.py check，漏登记即红）。
@@ -11,6 +11,7 @@
   sourceCommit 构建这个壳的 40 位源码提交号（只作记录，不进壳编号）
   chain       直连库链号（translator/dmsh_chain.py version()：只跟宿主读库的接口版本走）
   iosMin      iOS 最低版本（tools/toolchain.env IPHONEOS_DEPLOYMENT_TARGET）
+  iosSdk      壳链接的 iOS SDK 主版本（tools/toolchain.env IPHONEOS_SDK_MAJOR，审计 P1-124：换 SDK 要换编号，否则同号目录不覆盖、新系统机型按旧尺寸缩小）
 files 列壳目录里每个普通文件的相对路径、大小、SHA-256（按路径排序）；壳目录不许有链接、特殊文件、仅大小写不同的两个路径（Windows 盘不分大小写）。
 
 用法：
@@ -49,8 +50,8 @@ class Mismatch(ShellError):   # 壳目录与清单不符、壳编号对不上（
     pass
 
 
-def shell_id(inputs, chain, ios_min):
-    return hashlib.sha256(f"s2a.shell.v2\0{inputs}\0{chain}\0{ios_min}".encode()).hexdigest()[:16]
+def shell_id(inputs, chain, ios_min, ios_sdk):
+    return hashlib.sha256(f"s2a.shell.v2\0{inputs}\0{chain}\0{ios_min}\0{ios_sdk}".encode()).hexdigest()[:16]
 
 
 def inputs_key(repo=ROOT, rev="HEAD"):
@@ -67,15 +68,17 @@ def inputs_key(repo=ROOT, rev="HEAD"):
     return hashlib.sha256(body.encode("utf-8", "surrogateescape")).hexdigest()[:16]
 
 
-def _identity(source_commit, inputs, chain, ios_min):
+def _identity(source_commit, inputs, chain, ios_min, ios_sdk):
     if not isinstance(source_commit, str) or not re.fullmatch("[0-9a-f]{40}", source_commit):
         raise ShellError("构建提交号要 40 位十六进制")
     if not isinstance(inputs, str) or not re.fullmatch("[0-9a-f]{16}", inputs):
         raise ShellError("壳输入指纹要 16 位十六进制")
     if not isinstance(chain, str) or not re.fullmatch("[0-9a-z]{1,12}", chain):
         raise ShellError("直连链号不对（1–12 位）")
-    if not isinstance(ios_min, str) or not re.fullmatch(r"\d+(\.\d+){0,2}", ios_min):
-        raise ShellError("iOS 最低版本不对")
+    if not isinstance(ios_min, str) or not re.fullmatch(r"(tvos)?\d+(\.\d+){0,2}", ios_min):
+        raise ShellError("最低版本不对（iOS 写数字，Apple TV 带 tvos 前缀）")
+    if not isinstance(ios_sdk, str) or not re.fullmatch(r"(tvos)?\d{1,3}", ios_sdk):
+        raise ShellError("iOS SDK 主版本不对")
 
 
 def _root(root):
@@ -108,11 +111,11 @@ def _inventory(root):
     return entries
 
 
-def _document(root, source_commit, inputs, chain, ios_min):
-    _identity(source_commit, inputs, chain, ios_min)
+def _document(root, source_commit, inputs, chain, ios_min, ios_sdk):
+    _identity(source_commit, inputs, chain, ios_min, ios_sdk)
     doc = {"schema": "s2a.artifact.v2", "target": TARGET, "files": _inventory(root),
-           "details": {"schema": SCHEMA, "shellId": shell_id(inputs, chain, ios_min), "inputs": inputs,
-                       "sourceCommit": source_commit, "chain": chain, "iosMin": ios_min}}
+           "details": {"schema": SCHEMA, "shellId": shell_id(inputs, chain, ios_min, ios_sdk), "inputs": inputs,
+                       "sourceCommit": source_commit, "chain": chain, "iosMin": ios_min, "iosSdk": ios_sdk}}
     validate("artifact", doc)
     return doc
 
@@ -134,10 +137,10 @@ def load(manifest):
     if set(doc) != {"schema", "target", "files", "details"} or doc["target"] != TARGET:
         raise ShellError("不是壳清单（target 要 ios-shell）")
     d = doc["details"]
-    if set(d) != {"schema", "shellId", "inputs", "sourceCommit", "chain", "iosMin"} or d["schema"] != SCHEMA:
+    if set(d) != {"schema", "shellId", "inputs", "sourceCommit", "chain", "iosMin", "iosSdk"} or d["schema"] != SCHEMA:
         raise ShellError(f"未知壳清单子格式（要 {SCHEMA}）")
-    _identity(d["sourceCommit"], d["inputs"], d["chain"], d["iosMin"])
-    if d["shellId"] != shell_id(d["inputs"], d["chain"], d["iosMin"]):
+    _identity(d["sourceCommit"], d["inputs"], d["chain"], d["iosMin"], d["iosSdk"])
+    if d["shellId"] != shell_id(d["inputs"], d["chain"], d["iosMin"], d["iosSdk"]):
         raise ShellError("清单里的壳编号与它记的输入指纹 / 链号 / iOS 版本对不上")
     for e in doc["files"]:
         if set(e) != {"path", "size", "sha256"}: raise ShellError("文件条目字段不对")
@@ -182,13 +185,13 @@ def require(manifest, need):
     return doc
 
 
-def seal(root, manifest, source_commit, inputs, chain, ios_min):
+def seal(root, manifest, source_commit, inputs, chain, ios_min, ios_sdk):
     root = _root(root); dest = Path(manifest)
     if dest.is_symlink() or dest.resolve().is_relative_to(root):
         raise ShellError("清单要写在壳目录外面，且不能是链接")
     if dest.exists():
         raise ShellError(f"不覆盖已有清单：{dest}")
-    doc = _document(root, source_commit, inputs, chain, ios_min)
+    doc = _document(root, source_commit, inputs, chain, ios_min, ios_sdk)
     data = (json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     fd, tmp = tempfile.mkstemp(prefix=".shell-", dir=dest.resolve().parent)
     try:
@@ -202,39 +205,51 @@ def seal(root, manifest, source_commit, inputs, chain, ios_min):
     return doc
 
 
-def _defaults():   # 本仓库当前提交、壳输入指纹、直连链号、iOS 部署目标
+def apple_os(platform=None):
+    """出哪个平台的壳：参数 > 环境变量 S2A_APPLE_OS（顶层 Makefile 同名开关）> ios"""
+    p = platform or os.environ.get("S2A_APPLE_OS") or "ios"
+    if p not in ("ios", "tvos"):
+        raise ShellError(f"S2A_APPLE_OS 只认 ios / tvos，给的是 {p}")
+    return p
+
+
+def _defaults(platform=None):   # 本仓库当前提交、壳输入指纹、直连链号、部署目标、SDK 主版本（Apple TV：两项带 tvos 前缀，11-15）
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     sys.path.insert(0, str(ROOT / "translator")); import dmsh_chain
     env = (ROOT / "tools/toolchain.env").read_text()
-    m = re.search(r"^IPHONEOS_DEPLOYMENT_TARGET\s*[:?]?=\s*(\S+)", env, re.M)
-    return commit, inputs_key(), dmsh_chain.version(), m.group(1) if m else ""
+    tv = apple_os(platform) == "tvos"
+    m = re.search(r"^%s\s*[:?]?=\s*(\S+)" % ("TVOS_DEPLOYMENT_TARGET" if tv else "IPHONEOS_DEPLOYMENT_TARGET"), env, re.M)
+    sdk = re.search(r"^%s\s*[:?]?=\s*(\S+)" % ("TVOS_SDK_MAJOR" if tv else "IPHONEOS_SDK_MAJOR"), env, re.M)
+    pre = "tvos" if tv else ""
+    return commit, inputs_key(), dmsh_chain.version(), pre + m.group(1) if m else "", pre + sdk.group(1) if sdk else ""
 
 
-def current_id():   # 本树该用的壳编号：出包取壳、组装核壳都用它
+def current_id(platform=None):   # 本树该用的壳编号：出包取壳、组装核壳都用它（platform 不给按 S2A_APPLE_OS，缺省 ios）
     """开发树：按输入表在 HEAD 上算。发布快照（App / 启动器内置引擎，根有 engine.json）：读打包时写进去的 shellId——
     快照只收部分目录、还剔了测试目录，在快照里按目录对象号重算会与出壳时不同（platforms/bundle_engine.py write_manifest 写）"""
     eng = ROOT / "engine.json"
+    tv = apple_os(platform) == "tvos"
     if eng.is_file():
-        sid = json.loads(eng.read_text(encoding="utf-8")).get("shellId")
+        sid = json.loads(eng.read_text(encoding="utf-8")).get("shellIdTvos" if tv else "shellId")
         if not (isinstance(sid, str) and re.fullmatch("[0-9a-f]{16}", sid)):
             raise ShellError("发布快照的 engine.json 里没有壳编号 shellId（引擎打包时没写，重新打包引擎）")
         return sid
-    _, inputs, chain, ios_min = _defaults()
-    return shell_id(inputs, chain, ios_min)
+    _, inputs, chain, ios_min, ios_sdk = _defaults(platform)
+    return shell_id(inputs, chain, ios_min, ios_sdk)
 
 
 def main():
     ap = argparse.ArgumentParser(description="壳的发版清单：seal / verify / require")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("seal"); p.add_argument("--root", required=True); p.add_argument("--manifest", required=True)
-    p.add_argument("--source-commit"); p.add_argument("--inputs"); p.add_argument("--chain"); p.add_argument("--ios-min")
+    p.add_argument("--source-commit"); p.add_argument("--inputs"); p.add_argument("--chain"); p.add_argument("--ios-min"); p.add_argument("--ios-sdk")
     p = sub.add_parser("verify"); p.add_argument("--root", required=True); p.add_argument("--manifest", required=True)
     p = sub.add_parser("require"); p.add_argument("--manifest", required=True); p.add_argument("--shell-id", required=True)
     a = ap.parse_args()
     try:
         if a.cmd == "seal":
-            c, ik, ch, im = (a.source_commit, a.inputs, a.chain, a.ios_min) if a.source_commit and a.inputs and a.chain and a.ios_min else _defaults()
-            doc = seal(a.root, a.manifest, a.source_commit or c, a.inputs or ik, a.chain or ch, a.ios_min or im)
+            c, ik, ch, im, sdk = (a.source_commit, a.inputs, a.chain, a.ios_min, a.ios_sdk) if a.source_commit and a.inputs and a.chain and a.ios_min and a.ios_sdk else _defaults()
+            doc = seal(a.root, a.manifest, a.source_commit or c, a.inputs or ik, a.chain or ch, a.ios_min or im, a.ios_sdk or sdk)
             print(f"🟢 壳清单 {doc['details']['shellId']}：{len(doc['files'])} 个文件 → {a.manifest}")
         elif a.cmd == "verify":
             doc = verify(a.root, a.manifest); print(f"🟢 壳 {doc['details']['shellId']} 校验通过：{len(doc['files'])} 个文件")

@@ -11,7 +11,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 source "$ROOT/android/tools/fetch_source.sh"   # 源码包按 sha256 进本机共享缓存（S2A_BUILD_CACHE/sources），命中不联网；下载按进展判挂死
 # 整机级缓存：键 = 本脚本内容（含版本与 sha256）+ 平台，各工作树共用
 C=${S2A_OPUS_CACHE:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/cache/opus}; mkdir -p "$C"
-TCE=$ROOT/tools/toolchain.env; MMAC=$(sed -n 's/^MACOSX_DEPLOYMENT_TARGET=//p' "$TCE"); MIOS=$(sed -n 's/^IPHONEOS_DEPLOYMENT_TARGET=//p' "$TCE")   # 产物下限只取统一工具链那两行
+TCE=$ROOT/tools/toolchain.env; MMAC=$(sed -n 's/^MACOSX_DEPLOYMENT_TARGET=//p' "$TCE"); MIOS=$(sed -n 's/^IPHONEOS_DEPLOYMENT_TARGET=//p' "$TCE"); MTVOS=$(sed -n 's/^TVOS_DEPLOYMENT_TARGET=//p' "$TCE")   # 产物下限只取统一工具链那两行
 [ -n "$MMAC" ] && [ -n "$MIOS" ] || { echo "🔴 $(basename "$(dirname "$0")")：$TCE 里没有部署目标" >&2; exit 1; }
 OUT=$C/$RID-$VER-$( { cat "$0"; echo "$MMAC $MIOS"; } | shasum -a 256 | cut -c1-12)   # 下限进键：改了就重编
 # 几棵树同时编同一键时排队（.tmp 名字不撞）
@@ -22,6 +22,7 @@ case $RID in
   osx-arm64) MIN=-mmacosx-version-min=$MMAC; SDK=macosx ;;
   osx-x64) ARCH=x86_64; HOST=x86_64-apple-darwin; EXTRA=(--disable-asm --disable-intrinsics); MIN=-mmacosx-version-min=$MMAC; SDK=macosx ;;
   ios-arm64) MIN=-miphoneos-version-min=$MIOS; SDK=iphoneos ;;
+  tvos-arm64) MIN=-mtvos-version-min=$MTVOS; SDK=appletvos ;;   # Apple TV（11-15）
   *) echo "🔴 opus：不认识的平台 $RID" >&2; exit 1 ;;
 esac
 CC="xcrun --sdk $SDK clang -arch $ARCH $MIN"
@@ -39,7 +40,7 @@ if [ ! -s "$OUT/libopus.a" ]; then
   # 浮点版（缺省）、不带深度学习 / 扩展（DRED / 深度 PLC / OSCE / QEXT 缺省关）；arm64 苹果平台 NEON 恒在，免运行时探测
   # 缓存在带空格目录（启动器：~/Library/Application Support）时 autoconf 报「unsafe srcdir」、make 拆路径：configure / make 走无空格别名（tools/nospace.sh）
   source "$ROOT/tools/nospace.sh"; WN=$(s2a_nospace "$W")
-  ( cd "$WN/obj" && CC="$CC" CFLAGS="-O2 -fPIC -ffile-prefix-map=$WN/src=opus" "$WN/src/configure" --host="$HOST" "${EXTRA[@]}" --enable-static --disable-shared \
+  ( cd "$WN/obj" && CC="$CC" CFLAGS="-O2 -fPIC -ffile-prefix-map=$WN/src=opus" "$WN/src/configure" --host="$HOST" ${EXTRA[@]+"${EXTRA[@]}"} --enable-static --disable-shared \
       --disable-doc --disable-extra-programs --disable-rtcd --disable-dependency-tracking \
       > "$W/configure.log" 2>&1 && make -j8 > "$W/make.log" 2>&1 ) || { echo "🔴 opus：$RID 构建失败（$W/*.log）" >&2; tail -5 "$W"/*.log >&2; exit 1; }
   mkdir -p "$W/out/include"; cp "$W/obj/.libs/libopus.a" "$W/out/"; cp "$W/src/include/"*.h "$W/out/include/"
@@ -61,5 +62,5 @@ if [ ! -s "$L" ]; then
   fi
   rm -rf "$OUT/s2a-$K"; mv "$OUT/s2a-$K.tmp" "$OUT/s2a-$K"
 fi
-touch "$OUT"   # 取用即更新目录时间：tools/gc.sh 每平台留 2 份、30 分钟内动过的不删，在用的这份不被别的键挤掉
+touch "$OUT"   # 取用即更新目录时间：维护方 gc.sh（${S2A_PRIVATE_TOOLS}，公开仓没有）每平台留 2 份、30 分钟内动过的不删；公开检出没有清理方，旧键目录要手动删
 echo "$L"

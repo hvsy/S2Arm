@@ -3,7 +3,9 @@
 # 玩家没有主机固件导出的系统数据时，造一份「空但格式合法」的替代内容放进包（维护者 10-25 批准：「能让玩家不要面对这个问题」）。
 # 只按 Ryujinx 的公开实现推格式，不含任何任天堂数据。同输入逐字节同输出（gzip 头 mtime=0、无文件名）。
 #   0100000000000823 屏蔽词表 NgWord：每张词典都是「零个词条」，游戏检查名字永远判不含屏蔽词。
+#   0100000000000806 旧版屏蔽词表 NgWord（早期 SDK 的游戏自己挂、自己读）：每张表一条永远匹配不上的式子，同样判不含屏蔽词。
 #   0100000000000802 Mii 资源 MiiModel：形状零面积、贴图 1×1 全 0（pack/sysdata_mii.py，含格式校验 check）。
+#   0400000000000849 Switch 2 Mii 资源：同 0802 的结构，另加 6 个 OunceTexture 贴图（见 mii_ounce）。
 # iOS / 安卓共用打包层：pack/stage_sysdata.sh 经 pack/sysdata_need.py 的 SYNTH 行调本脚本；--ids 打会合成的号（sysdata_need.py 对每款都提供这些号：没有真的就合成）。
 # 扩展：在 GEN 里登记 号 → 生成函数（函数返回 {文件名: 字节}）。
 import gzip, io, os, struct, sys
@@ -144,13 +146,41 @@ def ngword():
     return out
 
 
+# ---------- 0100000000000806 旧版 NgWord ----------
+# 早期 SDK 的游戏（如 #886：输完名字点确定 → OpenDataStorageByDataId(0806)，没有这份就 Break）不走 ngc 服务，自己挂这份读。
+# 布局按公开模拟器实现推：0.txt–15.txt（按区域号）+ common.txt，每份是 UTF-16 大端、带 BOM 的文本，一行一条正则；version.dat 为 u32 大端。
+# 每份只放一条匹配不上任何名字的式子（不放零条：早期 SDK 对空文件的处理没有资料可核）
+NGWORD1_REGIONS = 16
+NGWORD1_VERSION = 0x20
+NGWORD1_LINE = '^s2arm0no0banned0words0placeholder$\n'
+
+
+def ngword1():
+    txt = b'\xfe\xff' + NGWORD1_LINE.encode('utf-16-be')
+    out = {f'{i}.txt': txt for i in range(NGWORD1_REGIONS)}
+    out['common.txt'] = txt
+    out['version.dat'] = struct.pack('>I', NGWORD1_VERSION)
+    return out
+
+
 def mii():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import sysdata_mii
     s, t = sysdata_mii.shape_file(), sysdata_mii.tex_file()
     return {**{n: s for n in sysdata_mii.SHAPES}, **{n: t for n in sysdata_mii.TEXTURES}}
 
 
-GEN = {'0100000000000802': mii, '0100000000000823': ngword}
+# Switch 2 的 Mii 资源（0400000000000849）：Switch Sports Resort 在 main+0x320040 按一个标志选 0x849 或 0x849 − 0x47 = 0802 挂成 MiiResource，
+#   游戏里的文件名除 0802 那 6 个外多了 OunceTexture{High,Mid,Low}{Linear,SRGB}.dat（Ounce = Switch 2）。真数据的格式没有核对过：
+#   这里沿用 0802 的形状 / 贴图结构（贴图文件同一份），目的只是「挂得上、按名字打得开、读到的是合法的空资源」
+OUNCE_TEXTURES = tuple(f'OunceTexture{q}{c}.dat' for q in ('High', 'Mid', 'Low') for c in ('Linear', 'SRGB'))
+
+
+def mii_ounce():
+    files = mii()
+    return {**files, **{n: files['NXTextureLowLinear.dat'] for n in OUNCE_TEXTURES}}
+
+
+GEN = {'0100000000000802': mii, '0100000000000806': ngword1, '0100000000000823': ngword, '0400000000000849': mii_ounce}
 
 
 def main():

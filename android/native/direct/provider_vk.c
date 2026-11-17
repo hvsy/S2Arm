@@ -288,14 +288,27 @@ static int sync_window_locked(struct provider_context *ctx, int64_t attach_budge
     int lease_has = trc == 0 && st.window != NULL;
     if (lease_has && lease->release_window) lease->release_window(lease->lease, st.window);
 
-    int32_t win_w = ctx->lease_window ? ANativeWindow_getWidth((ANativeWindow *)ctx->lease_window) : 0;
-    int32_t win_h = ctx->lease_window ? ANativeWindow_getHeight((ANativeWindow *)ctx->lease_window) : 0;
-    // 用建链时记录的“发布窗口尺寸”，不是被 surface min/max 夹取后的 extent：
-    // 夹取是合法的，不能因此每帧误判成 resize。
+    int32_t win_w, win_h, attached_w = 0, attached_h = 0;
+    if (session && session->swapchain.buf_geometry) {
+        // B3：缓冲已被改成渲染目标尺寸，getWidth/getHeight 只报告缓冲尺寸，窗口像素
+        // 从租约的 surfaceChanged frame 读；还没有 surfaceChanged 时回落 getWidth
+        // （几何覆盖没发生前 getWidth 仍是 frame 像素）。对比的是建链时记下的 frame。
+        win_w = st.width > 0 ? st.width
+                             : (ctx->lease_window ? ANativeWindow_getWidth((ANativeWindow *)ctx->lease_window) : 0);
+        win_h = st.height > 0 ? st.height
+                              : (ctx->lease_window ? ANativeWindow_getHeight((ANativeWindow *)ctx->lease_window) : 0);
+        attached_w = (int32_t)session->swapchain.frame_width;
+        attached_h = (int32_t)session->swapchain.frame_height;
+    } else {
+        win_w = ctx->lease_window ? ANativeWindow_getWidth((ANativeWindow *)ctx->lease_window) : 0;
+        win_h = ctx->lease_window ? ANativeWindow_getHeight((ANativeWindow *)ctx->lease_window) : 0;
+        // 用建链时记录的“发布窗口尺寸”，不是被 surface min/max 夹取后的 extent：
+        // 夹取是合法的，不能因此每帧误判成 resize。
+        attached_w = session ? (int32_t)session->swapchain.window_width : 0;
+        attached_h = session ? (int32_t)session->swapchain.window_height : 0;
+    }
     int action = nvn_vk_window_action(
-        1, ctx->lease_generation,
-        session ? (int32_t)session->swapchain.window_width : 0,
-        session ? (int32_t)session->swapchain.window_height : 0,
+        1, ctx->lease_generation, attached_w, attached_h,
         lease_has, st.generation, st.stopping, win_w, win_h);
     if (action == NVK_WINDOW_REVOKED) {
         char text[192];
@@ -315,6 +328,16 @@ static int sync_window_locked(struct provider_context *ctx, int64_t attach_budge
         return 1;
     }
     if (action == NVK_WINDOW_REBUILD) {
+        if (session && session->swapchain.buf_geometry) {
+            // B3：交换链 extent=缓冲尺寸（渲染目标），view frame 变化不碰交换链；
+            // 只刷新窗口像素，触摸/日志继续按新 frame 记。
+            session->swapchain.frame_width = (uint32_t)st.width;
+            session->swapchain.frame_height = (uint32_t)st.height;
+            __android_log_print(ANDROID_LOG_INFO, TAG,
+                                "direct present: buffer-geometry frame updated to %dx%d (gen %llu, no rebuild)",
+                                (int)st.width, (int)st.height, (unsigned long long)ctx->lease_generation);
+            return 0;
+        }
         // 同一代窗口的发布尺寸变了（旋转/resize/分屏）：extent/crop 不能继续用旧值。
         if (s2a_vk_adapter_detach_window()) {
             set_window_error(ctx, "window resized but the old swapchain has no presentation-retirement proof; "
@@ -897,24 +920,13 @@ static int32_t prepare(const struct s2a_graphics_descriptor_v1 *descriptor, uint
     pthread_mutex_unlock(&g_window_mu);
     atomic_store(&g_owner_suspended_slices, 0);
     atomic_store(&g_owner_window_actions, 0);
-    // 首版正式 direct 必须真的启用 VK_EXT_swapchain_maintenance1 的 present fence：只有渲染 fence
-    // 能证明“画完”，不能证明呈现引擎已释放图像。缺项在 commit 前拒绝，AUTO 因此走 generic。
-    if (!ctx->device.swapchain_maintenance1_enabled) {
-        snprintf(why, why_size,
-                 "presentation-retirement proof unavailable: VK_EXT_swapchain_maintenance1/"
-                 "swapchainMaintenance1 is not enabled on this device");
-        pthread_mutex_lock(&g_window_mu);
-        if (g_active_context == ctx) g_active_context = NULL;
-        pthread_mutex_unlock(&g_window_mu);
-        if (s2a_vk_device_destroy(&ctx->device, 0)) {
-            pthread_mutex_lock(&g_window_mu);
-            g_retained_context = ctx;
-            pthread_mutex_unlock(&g_window_mu);
-            return S2A_DIRECT_RES_RETIREMENT;
-        }
-        free(ctx);
-        return S2A_DIRECT_RES_UNSUPPORTED;
-    }
+    // 呈现退休证明：有 VK_EXT_swapchain_maintenance1 用 present fence；没有（安卓 13 及以下的系统
+    // libvulkan 不补，#426）由交换链改用同图像再 acquire 的 fence 证明（nvn_vk_swapchain.c）。
+    // 两种都不拿渲染 fence 冒充呈现退休，所以这里不再拒绝 direct，只记下走的是哪种。
+    __android_log_print(ANDROID_LOG_INFO, TAG, "direct presentation retirement: %s",
+                        ctx->device.swapchain_maintenance1_enabled
+                            ? "present fence (VK_EXT_swapchain_maintenance1)"
+                            : "same-image reacquire (no VK_EXT_swapchain_maintenance1)");
     ctx->state = S2A_DIRECT_PREPARED;
     ctx->blockers = S2A_DIRECT_BLOCK_ALL;
     ctx->generation = 1;   // provider 上下文代际：Stop/重建才有新值；transport 身份，不参与内容键
@@ -1019,8 +1031,8 @@ static int32_t prepare(const struct s2a_graphics_descriptor_v1 *descriptor, uint
                         VK_API_VERSION_MINOR(ctx->device.properties.apiVersion),
                         VK_API_VERSION_PATCH(ctx->device.properties.apiVersion), effective_profile_hash);
     // READY admission 的 GPU 身份门找的是 generic VulkanRenderer 的 PrintGpuInformation 行。
-    // 这行本身必须证明直连 prepare 走完：只能打在上面三道拒绝闸（storage 能力 /
-    // swapchain_maintenance1 / profile 合成）全部通过之后、返回 OK 之前；否则被拒时日志里
+    // 这行本身必须证明直连 prepare 走完：只能打在上面两道拒绝闸（storage 能力 /
+    // profile 合成）全部通过之后、返回 OK 之前；否则被拒时日志里
     // 仍有身份行，AUTO 转 generic 再失败会被这行误判 READY 通过（假绿）。
     // 值只来自本机 VkPhysicalDeviceProperties / driverProperties。
     {

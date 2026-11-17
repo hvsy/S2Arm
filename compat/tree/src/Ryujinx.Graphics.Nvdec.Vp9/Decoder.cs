@@ -10,6 +10,13 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
     {
         public bool IsHardwareAccelerated => false;
 
+        // S2Arm: the spec default probability table in Vp9EntropyProbs layout (what a job's supplied
+        // table looks like when its base context is the VP9 defaults — ctx-frozen streams and every
+        // key frame). Hardware backends that can only decode repacked frames with their built-in
+        // context (AMediaCodec; Vp9NativeHeader writes refresh_frame_context=0 so its ctx[0] stays at
+        // these defaults) compare a job's supplied table against this to decide representability.
+        public static Vp9EntropyProbs DefaultProbs() => EntropyMode.CreateDefaultProbs();
+
         private readonly MemoryAllocator _allocator = new();
         private byte[] _lastSegmentMap = [];
         private int _lastSegmentMapMiRows;
@@ -91,6 +98,7 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
             cm.Lf.ModeRefDeltaEnabled = pictureInfo.ModeRefDeltaEnabled;
             cm.Lf.RefDeltas = pictureInfo.RefDeltas;
             cm.Lf.ModeDeltas = pictureInfo.ModeDeltas;
+            LoopFilter.LoopFilterInit(ref cm);
 
             Span<RefBuffer> frameRefsSpan = cm.FrameRefs.AsSpan();
             frameRefsSpan[0].Buf = (Surface)pictureInfo.LastReference;
@@ -131,10 +139,21 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
                 {
                     try
                     {
+                        // S2Arm: tile decode can only go wide with several tile columns, but the loop filter
+                        // works on superblock rows (LfSync row/column sync), so it goes wide for any tile
+                        // layout. Upstream tied both to tileCols > 1, which kept single-column streams
+                        // (e.g. P4G's 1080p cutscenes) on one thread for the whole frame.
                         if (maxThreads > 1 && tileRows == 1 && tileCols > 1)
                         {
                             DecodeFrame.DecodeTilesMt(ref cm, new ArrayPtr<byte>(dataPtr, bitstream.Length), maxThreads);
+                        }
+                        else
+                        {
+                            DecodeFrame.DecodeTiles(ref cm, new ArrayPtr<byte>(dataPtr, bitstream.Length));
+                        }
 
+                        if (maxThreads > 1)
+                        {
                             LoopFilter.LoopFilterFrameMt(
                                 ref cm.Mb.CurBuf,
                                 ref cm,
@@ -146,8 +165,6 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
                         }
                         else
                         {
-                            DecodeFrame.DecodeTiles(ref cm, new ArrayPtr<byte>(dataPtr, bitstream.Length));
-
                             LoopFilter.LoopFilterFrame(
                                 ref cm.Mb.CurBuf,
                                 ref cm,
@@ -201,6 +218,34 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
             _lastSegmentMapMiRows = cm.MiRows;
             _lastSegmentMapMiCols = cm.MiCols;
             _lastSegmentMap.CopyTo(cm.LastFrameSegMap.AsSpan());
+        }
+
+        // S2Arm: the segment-map bookkeeping LoadSegmentMap does, for a frame decoded elsewhere (native libvpx,
+        // Ryujinx.Graphics.Nvdec Vp9NativePath). Native frames have segmentation off, so this keeps the state equal to an
+        // all-managed run and a later switch to this decoder is exact.
+        public void TrackSegmentMap(bool keyOrIntraOnly, int width, int height)
+        {
+            int miCols = (width + 7) >> 3;
+            int miRows = (height + 7) >> 3;
+            int mapLength = miRows * miCols;
+            if (mapLength == 0)
+            {
+                return;
+            }
+
+            bool reset = keyOrIntraOnly || _lastSegmentMapMiRows != miRows || _lastSegmentMapMiCols != miCols;
+
+            if (_lastSegmentMap.Length != mapLength)
+            {
+                _lastSegmentMap = new byte[mapLength];
+            }
+            else if (reset)
+            {
+                Array.Clear(_lastSegmentMap);
+            }
+
+            _lastSegmentMapMiRows = miRows;
+            _lastSegmentMapMiCols = miCols;
         }
 
         private void SaveSegmentMap(ref Vp9Common cm)

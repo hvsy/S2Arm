@@ -24,7 +24,7 @@ elif [ -d "$IN/exefs" ]; then
   cp "$IN/exefs/main.npdm" "$MODS/"
   "$PY" "$ROOT/graphics/nvn/games/profile_guess.py" --gpu-drivers "$IN/exefs" > "$MODS/gpu_drivers.tsv" || { echo "🔴 $G 判 GPU 驱动模块失败"; exit 1; }   # 直连跳过的驱动模块（同 pack/stage_rewrite.sh）
 else echo "🔴 ${G}：S2A_IN=$IN 里既没有改写产物也没有 exefs/"; exit 1; fi
-# S2A_HOST_PREBUILT=1：调用方已在局时限外编好宿主（tools/entry_check.sh），这里不再 make（10-29 本机：多棵工作树共用 NativeAOT 缓存，
+# S2A_HOST_PREBUILT=1：调用方已在局时限外编好宿主（维护方 entry_check.sh），这里不再 make（10-29 本机：多棵工作树共用 NativeAOT 缓存，
 #   排局槽空档里别的工作树一编，这里的 make 就重新链接，几十秒算进局时，游戏正常收局却被 335 秒局槽杀、记成偶发崩溃）
 if [ "${S2A_HOST_PREBUILT:-}" = 1 ]; then [ -x "$ROOT/build/s2arm-host" ] || { echo "🔴 S2A_HOST_PREBUILT=1 但没有 $ROOT/build/s2arm-host"; exit 1; }
 else bash "$ROOT/tools/host_build.sh" || { echo "🔴 构建失败"; exit 1; }; fi   # 11-04：同树一把锁、S2A_CS 只升不降（tools/host_build.sh）
@@ -36,8 +36,8 @@ export S2A_MACRO_DUMP=${S2A_MACRO_DUMP:-$D/macro}; mkdir -p "$S2A_MACRO_DUMP"
 #   暖局要复用缓存就由调用方显式给同一个目录
 export S2A_DOCS=${S2A_DOCS:-$D} S2A_AUTOPLAY_OUT=${S2A_AUTOPLAY_OUT:-$D}
 export S2A_RYU_DATA=${S2A_RYU_DATA:-$D/ryu} NXGAL_SHADER_CACHE_DIR=${NXGAL_SHADER_CACHE_DIR:-$D/gal}; mkdir -p "$S2A_RYU_DATA" "$NXGAL_SHADER_CACHE_DIR"
-# 游戏数据（服务接入线 S2A_Init 登记游戏用：exefs/main.npdm、romfs/、ctl/control.nacp）：没给就用产物根本身
-[ -z "${S2A_GAME_DATA:-}" ] && [ -d "$IN/romfs" ] && export S2A_GAME_DATA=$IN
+# 游戏数据（服务接入线 S2A_Init 登记游戏用：exefs/main.npdm、romfs/ 或标准 RomFS 镜像 romfs.std、ctl/control.nacp）：没给就用产物根本身
+[ -z "${S2A_GAME_DATA:-}" ] && { [ -d "$IN/romfs" ] || [ -f "$IN/romfs.std" ]; } && export S2A_GAME_DATA=$IN
 # 存档：没显式给 S2A_SAVE_DIR 就用和真机局同一份正式局存档的副本（tools/mac_save.sh，10-24 维护者）
 source "$ROOT/tools/mac_save.sh"; mac_save_prep "$G" "$IN" "$D" > "$D/save.txt" || exit 1
 mac_slot_acquire() { :; }; mac_slot_release() { :; }; [ -z "${S2A_PRIVATE_TOOLS:-}" ] || source "$S2A_PRIVATE_TOOLS/mac_slot_frozen.sh" || exit 1; [ -n "${S2A_MAC_SLOT_HELD:-}" ] || { mac_slot_acquire "$G $D" || exit 1; export S2A_MAC_SLOT_HELD=1; }; trap mac_slot_release EXIT   # Mac 局全机并发上限（维护方设施：设了 S2A_PRIVATE_TOOLS 才排队，没设单机直接起）

@@ -6,6 +6,7 @@ using System;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Ryujinx.Horizon.Sdk.Codec.Detail
 {
@@ -97,6 +98,38 @@ namespace Ryujinx.Horizon.Sdk.Codec.Detail
             _workBufferHandle = workBufferHandle;
         }
 
+        // S2Arm：同时存活的解码器上限（0100A00019DE0000 存档后 Break 2010-0011）。游戏 SDK 的 hwopus 客户端只给 16 个解码器对象留了位置，
+        //   开第 17 个时客户端建代理失败（ResultSfCmifProxyAllocationFailed）直接中止；真机服务端在这之前就回 0x3026F，SDK 转成「资源不足」交给游戏、游戏自己退让。
+        //   真机实测这款同时最多开 16 个、开关成对（11-10 诊断包 632b71271）。单流 / 多流 / Ex 各入口共用这一个名额池。
+        internal const int MaxLive = 16;
+        private static int s_live;
+        private bool _reserved;
+
+        internal static int LiveCount => Volatile.Read(ref s_live);
+
+        internal static bool TryReserve()
+        {
+            if (Interlocked.Increment(ref s_live) <= MaxLive)
+            {
+                return true;
+            }
+
+            Interlocked.Decrement(ref s_live);
+            Logger.Info?.Print(LogClass.ServiceAudio, $"[S2A hwopus] 同时存活的解码器已到上限 {MaxLive}，这次回「资源不足」（0x3026F），游戏自己退让");
+
+            return false;
+        }
+
+        // 名额由 TryReserve 先占好：构造成功后挂到这个解码器上（Dispose 时还），构造失败由调用方 ReleaseReservation 还回去
+        internal HardwareOpusDecoder MarkReserved()
+        {
+            _reserved = true;
+
+            return this;
+        }
+
+        internal static void ReleaseReservation() => Interlocked.Decrement(ref s_live);
+
         public HardwareOpusDecoder(int sampleRate, int channelsCount, int workBufferHandle) : this(workBufferHandle)
         {
             _decoder = new NativeDecoder(sampleRate, channelsCount, 0, 0, null);
@@ -105,6 +138,23 @@ namespace Ryujinx.Horizon.Sdk.Codec.Detail
         public HardwareOpusDecoder(int sampleRate, int channelsCount, int streams, int coupledStreams, byte[] mapping, int workBufferHandle) : this(workBufferHandle)
         {
             _decoder = new NativeDecoder(sampleRate, channelsCount, streams, coupledStreams, mapping);
+        }
+
+        // hwacod（Switch 2 硬件音频编解码会话，HardwareAudioCodec.cs）的实例借这里的 libopus 解码：实例数由管理会话定，不占 MaxLive 名额，没有工作缓冲句柄
+        internal static HardwareOpusDecoder CreateForAudioCodec(int sampleRate, int channelsCount, int streams, int coupledStreams, byte[] mapping)
+        {
+            return mapping == null
+                ? new HardwareOpusDecoder(sampleRate, channelsCount, workBufferHandle: 0)
+                : new HardwareOpusDecoder(sampleRate, channelsCount, streams, coupledStreams, mapping, workBufferHandle: 0);
+        }
+
+        // 调用方已核过包头长度（input = 8 字节包头 + 包）。坏包先在这里如实回错：DecodeInterleaved 取样本数失败时回 Success、0 样本（上游原样，旧 hwopus 入口仍是）
+        internal Result DecodeForAudioCodec(ReadOnlySpan<byte> input, Span<byte> output, bool reset, out int outSamples)
+        {
+            outSamples = 0;
+            Result result = GetPacketNumSamples(_decoder, out _, input.Slice(8, (int)BinaryPrimitives.ReadUInt32BigEndian(input)));
+
+            return result.IsFailure ? result : DecodeInterleavedInternal(out _, out outSamples, out _, output, input, reset, withPerf: false);
         }
 
         [CmifCommand(0)]
@@ -337,6 +387,12 @@ namespace Ryujinx.Horizon.Sdk.Codec.Detail
                 }
 
                 _decoder?.Dispose();
+
+                if (_reserved)
+                {
+                    _reserved = false;
+                    Interlocked.Decrement(ref s_live);
+                }
             }
         }
 

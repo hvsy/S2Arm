@@ -6,11 +6,15 @@ make ios 由 clang / dotnet / Python / cp 等多种进程组成，阶段键的 P
 出壳前把仓库里算输入的文件（git 跟踪 + 未忽略，同 tools/stage_deps.py）的访问时间设成固定旧值，出壳后访问时间变新的就是这次被读过的——
 任何进程读都算（APFS / ReFS 读文件会更新访问时间：访问时间早于 24 小时前时必更新）。
 
-  closure.py mark    [<仓库根>]           出壳前：访问时间设旧（只改访问时间，不改内容与修改时间）
+  closure.py mark    [<仓库根>] [--list-from <带 .git 的树>]   出壳前：访问时间设旧（只改访问时间，不改内容与修改时间）；
+                                         --list-from：文件清单从那棵树取（门禁 iOS 编译在没有 .git 的私有镜像里编，tools/gate_ios.sh）
   closure.py observed [<仓库根>]          出壳后：打印被读过的文件（仓库相对路径，一行一个，已排序）
   closure.py check   [<仓库根>]           出壳后：被读过、但输入表 pack/stage_inputs/shell.tsv 没覆盖（不是「入」/「外」的文件，也不在其列的目录下）→ 逐个点名、退出 1
   closure.py pyimports [<仓库根>]          不出壳的静态核对（11-06 维护者：列车没有出壳这一步，#1586 让 pack/ship_ext.py import 新增的 tools/module_order.py、
                                          没登记就合进 main，全线出壳红）：表里「入」的 .py 逐个解析 import，顺着解析到的仓库模块递归，没被表覆盖的报红；几秒内跑完
+  closure.py csiblings [<仓库根>]          不出壳的静态核对（11-10 v0.2.3 出壳红：单只 Joy-Con 2 新增 runtime/ns2pro/NS2JoyCon.c 没登记，列车没有出壳这一步）：
+                                         表里逐文件登记过的目录下，git 跟踪的 C 系文件（.c .m .mm .cpp .h .hpp .inc）必须是「入」「外」或「不」（不编进壳）之一；
+                                         没登记的点名、退 1。「不」行只给本核对用，出壳闭包与壳编号都不认它
   closure.py suggest [<仓库根>]           冷出壳后：把被读过的文件收成表行（目录里跟踪文件被读 ≥ 80% 的整目录收成一行，多收只会多重出壳、不会漏）
 
 新依赖只能经由已登记文件的改动引入（加 #include、加源文件都要改已登记的源码 / 构建脚本），而改动必然让那部分重编、新文件被读到，
@@ -46,9 +50,11 @@ def settle_index(repo):
     subprocess.run(['git', '-C', repo, 'update-index', '-q', '--refresh'], capture_output=True)   # 有改动的文件退出非 0，不影响（改动由 shell_build.sh 前面那步拦）
 
 
-def mark(repo):
-    settle_index(repo)
-    n = 0; files = tracked(repo)
+def mark(repo, list_from=None):
+    """list_from：文件清单取自另一棵带 .git 的树（门禁 iOS 编译在没有 .git 的私有镜像里编，tools/gate_ios.sh），镜像里不刷 git 索引"""
+    if list_from is None:
+        settle_index(repo)
+    n = 0; files = tracked(list_from or repo)
     with open(listing(repo), 'w', encoding='utf-8', newline='\n') as f: f.write(''.join(x + '\n' for x in files))
     for f in files:
         p = os.path.join(repo, f)
@@ -91,6 +97,22 @@ def table(repo):   # → (入 / 外 的文件与目录集合)
 
 def covered(f, rows):
     return any(f == p or f.startswith(p + '/') for _, p in rows)
+
+
+C_FAMILY = ('.c', '.m', '.mm', '.cpp', '.h', '.hpp', '.inc')
+
+
+def c_siblings(repo):
+    """→ 表里逐文件登记过的目录下、没登记的 git 跟踪 C 系文件（排序）。「不」行（不编进壳）算已登记；整目录登记的目录下本来就全覆盖，不用看"""
+    rows = table(repo)
+    no = set()
+    with open(os.path.join(repo, TABLE), encoding='utf-8') as t:
+        for line in t:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) >= 2 and parts[0] == '不': no.add(parts[1].rstrip('/'))
+    files = tracked(repo); fs = set(files)
+    dirs = {os.path.dirname(p) for _, p in rows if p in fs}
+    return sorted(f for f in files if f.endswith(C_FAMILY) and os.path.dirname(f) in dirs and f not in no and not covered(f, rows))
 
 
 def py_imports(repo, rows):
@@ -165,8 +187,14 @@ def suggest(repo, seen, frac=0.8):
 
 
 def main(a):
-    if not a or a[0] not in ('mark', 'observed', 'check', 'suggest', 'pyimports'): print(__doc__, file=sys.stderr); return 2
+    if not a or a[0] not in ('mark', 'observed', 'check', 'suggest', 'pyimports', 'csiblings'): print(__doc__, file=sys.stderr); return 2
     repo = os.path.abspath(a[1]) if len(a) > 1 else R0
+    if a[0] == 'csiblings':
+        repo = a[1] if len(a) > 1 else '.'
+        miss = c_siblings(repo)
+        for f in miss: print(f'【红】{f}：和表里逐文件登记的源码同目录，却没登记（编进壳记「入」，只读不影响产物记「外」，不编进壳记「不」）')
+        print(f"壳输入表同目录 C 系核对：{'漏登记 ' + str(len(miss)) + ' 个' if miss else '0 个漏登记'}")
+        return 1 if miss else 0
     if a[0] == 'pyimports':
         miss = py_imports(repo, table(repo))
         if miss:
@@ -174,7 +202,9 @@ def main(a):
             print('  影响壳内容的记「入」，只读不影响产物的记「外」；和 import 它的改动同一笔登记', file=sys.stderr)
             return 1
         print('壳输入表 Python import 闭包：全在表里'); return 0
-    if a[0] == 'mark': print(f'壳输入闭包：{mark(repo)} 个仓库文件访问时间已设旧'); return 0
+    if a[0] == 'mark':
+        lf = os.path.abspath(a[a.index('--list-from') + 1]) if '--list-from' in a else None
+        print(f'壳输入闭包：{mark(repo, lf)} 个仓库文件访问时间已设旧'); return 0
     seen = observed(repo)
     if a[0] == 'observed': sys.stdout.write(''.join(f + '\n' for f in seen)); return 0
     if a[0] == 'suggest': sys.stdout.write(''.join(f'入\t{p}\n' for p in suggest(repo, seen))); return 0

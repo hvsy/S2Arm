@@ -12,10 +12,19 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pack.orch import roots, stages, refresh
+
+
+
+def replace_bytes(path, data):
+    """换掉一个源文件（先删再写新文件），不原地改写：Windows 上建产物根时 RomFS 与解包目录是硬链接（roots.copy_file link_ok），
+    原地写会连带改到共享存储里那份，开发 / 门禁机上它还被封成只读（roots.seal）。真实流程里原版换了是重新解包、出的是新文件"""
+    path.unlink(missing_ok=True)
+    path.write_bytes(data)
 
 
 class LightTest(unittest.TestCase):
@@ -74,6 +83,32 @@ class LightTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('【红】编排中止：[Errno 31] 连到系统上的设备没有发挥作用。', err.getvalue())
         self.assertIn('deep_win32_call', err.getvalue())
+
+    def test_seed_cleanup_error_keeps_cause(self):
+        # #669：播种某步失败 → 删半成品时又报 WinError 145（目录不是空的）。原先 145 盖住起因、红字又不在日志最后几行，玩家报告只剩包装层一帧。
+        #   期望手写：日志最后一行是红字，含起因「改名失败」和清理失败的附注；不再是 145 当主错误
+        def commit(self, **kw): raise OSError(13, '改名失败')
+        def abort(self): raise OSError(41, '目录不是空的。')
+        err = io.StringIO()
+        with patch.object(refresh, 'Roots', return_value=self.store), patch.object(roots.Transaction, 'commit', commit), \
+                patch.object(roots.Transaction, 'abort', abort), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = refresh.main(['原创', '--from-extract', str(self.source), '--stages', ''])
+        self.assertEqual(code, 1)
+        last = err.getvalue().strip().splitlines()[-1]
+        self.assertTrue(last.startswith('【红】编排中止：[Errno 13] 改名失败'), last)
+        self.assertIn('随后的清理 abort', last)
+        self.assertIn('目录不是空的', last)
+
+    def test_seed_reports_file_progress(self):
+        # #361：播种逐文件拷时写「播种 已拷 / 总数」（出包进度协议），不再让进度条停在解包 100% 像卡死。期望手写：源里 exefs 1 个 + romfs 3 个文件 →
+        #   总数 4，最后一行已拷 = 4（每秒最多一行，末项必写）
+        for n in ('a', 'b', 'c'):
+            (self.source / 'romfs' / n).write_bytes(n.encode())
+        prog = self.home / 'progress.tsv'
+        with patch.dict(os.environ, {'S2A_PROGRESS': str(prog)}):
+            refresh.seed(self.store, '原创', self.source)
+        rows = [l.split('\t') for l in prog.read_text(encoding='utf-8').splitlines() if '\t播种\t' in l]
+        self.assertTrue(rows); self.assertEqual(rows[-1][2:], ['4', '4'])
 
     def test_shaders_stage_is_gone(self):
         # 只服务通用模式的着色器阶段（11-07 拆通用模式）：编排不再认它，--stages shaders 当未知阶段拒（argparse 退 2）
@@ -202,6 +237,31 @@ class LightTest(unittest.TestCase):
         (overlay / 'romfs/Layout').mkdir(parents=True)
         return overlay, tv
 
+    def test_layout_ignores_seed_source_of_another_game(self):
+        # v0.3.0 Windows 玩家实报：seed.txt 记的解包目录指到了别的款（unpack.tsv 程序号不同、里面有同名布局文件）。期望：不拿它当原版，
+        #   改用现行产物根的 romfs（本款原版）——用的覆盖缓存按本款原版的身份找到、覆盖层是本款的；打一行黄字说明
+        (self.source / 'unpack.tsv').write_text('title_id\t0100AAAA00000000\n', encoding='utf-8')
+        (self.source / 'romfs/Layout').mkdir(); (self.source / 'romfs/Layout/one').write_bytes(b'ours one')
+        refresh.seed(self.store, '原创', self.source)
+        other = self.home / 'other-game-extract'; (other / 'romfs/Layout').mkdir(parents=True)
+        (other / 'romfs/Layout/one').write_bytes(b'THEIRS one!'); (other / 'unpack.tsv').write_text('title_id\t01007EF00011E000\n', encoding='utf-8')
+        tx = self.store.begin('原创', self.store.tag('原创', 'wrong-seed'))
+        roots.text(tx.path / 'seed.txt', f'src={other}\n'); tx.commit()
+        current = self.store.cur('原创')
+        generator = stages.REPO / 'graphics/widen/scan/ui_lyt.py'
+        files = ('graphics/widen/scan/ui_lyt.py', 'graphics/widen/scan/yaz0enc.c',
+                 'graphics/nvn/tools/romfs_list.py', 'graphics/tools/nxfmt.py', 'graphics/tools/yaz0dec.c')
+        tv = hashlib.sha256(b''.join((stages.REPO / q).read_bytes() for q in files)).hexdigest()[:12]
+        overlay = self.home / 'overlays' / ('原创_' + bytes(16).hex()) / ('ui_w2346_' + tv + '_' + stages.layout_source_identity(current / 'romfs'))
+        (overlay / 'romfs/Layout').mkdir(parents=True); (overlay / 'romfs/Layout/one').write_bytes(b'widen ours')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            stages.Stages(self.store).execute('原创', 'uilayout')
+        current = self.store.cur('原创')
+        self.assertEqual((current / 'ui_overlay/romfs/Layout/one').read_bytes(), b'widen ours')
+        self.assertEqual((current / 'romfs/Layout/one').read_bytes(), b'ours one')
+        self.assertIn('是另一款 01007EF00011E000 的', err.getvalue())
+
     def test_layout_exact_key_restore_index_invalidation_and_original_unchanged(self):
         layout = self.source / 'romfs/Layout'
         layout.mkdir()
@@ -242,7 +302,7 @@ class LightTest(unittest.TestCase):
         self.assertEqual((layout / 'one').read_bytes(), b'original one')
         self.assertEqual((layout / 'two').read_bytes(), b'original two')
         # 审计 #1534 P1-54：原版换了（同大小、修改时间变）、构建号与工具都没变 → 不再用上一份覆盖包（目录名带原版身份），去重新生成
-        (layout / 'one').write_bytes(b'ORIGINAL one')
+        replace_bytes(layout / 'one', b'ORIGINAL one')
         os.utime(layout / 'one', ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
         with patch.object(stages.Stages, '_layout_tools', side_effect=stages.StageError('regenerate', 75)):
             with self.assertRaises(stages.StageError) as error:
@@ -294,6 +354,61 @@ class LightTest(unittest.TestCase):
         self.assertEqual((self.source / 'romfs/b').read_bytes(), b'bb')
         self.assertEqual((current / 'romfs/b').read_bytes(), b'bb')
 
+    def test_seed_romfs_image_and_clone(self):
+        # RomFS 镜像 romfs.std（标准 RomFS，与 romfs/ 同级）。期望按夹具手写：源只有镜像 → 现行有逐字节相同的 romfs.std、没有 romfs、存储里没有身份，
+        #   源原样还在（move_romfs 也不搬走镜像）；开工 / 提交的新版本镜像字节不变；Windows NTFS（refs 判否）上版本间是同一个文件（硬链接）；
+        #   再播目录形态 → 旧镜像删掉、romfs 回来
+        src = self.home / 'ex'; (src / 'exefs').mkdir(parents=True); (src / 'exefs/main').write_bytes(b'm')
+        blob = os.urandom(70001); (src / 'romfs.std').write_bytes(blob); (src / 'unpack.tsv').write_text('title_id\t0100aaaa00000000\n')
+        with patch.dict(os.environ, {'S2A_DUAL': '0'}):
+            cur = refresh.seed(self.store, '原创', src, move_romfs=True)
+        self.assertEqual((cur / 'romfs.std').read_bytes(), blob)
+        self.assertFalse(os.path.lexists(cur / 'romfs'))
+        self.assertEqual((src / 'romfs.std').read_bytes(), blob)
+        self.assertEqual(list((self.home / 'roots/.romfs_store').glob('原创/*')), [])
+        with patch.object(roots.sys, 'platform', 'win32'), patch.object(roots, 'refs_same_volume', return_value=False):
+            tx = self.store.begin('原创', 'after-image')
+            self.assertTrue(os.path.samefile(cur / 'romfs.std', tx.path / 'romfs.std'), 'NTFS：版本间硬链接同一份镜像，不实拷')
+        nxt = tx.commit()
+        self.assertEqual((nxt / 'romfs.std').read_bytes(), blob)
+        back = self.home / 'ex2'; (back / 'exefs').mkdir(parents=True); (back / 'exefs/main').write_bytes(b'm')
+        (back / 'romfs').mkdir(); (back / 'romfs/a').write_bytes(b'r')
+        with patch.dict(os.environ, {'S2A_DUAL': '0'}):
+            cur = refresh.seed(self.store, '原创', back)
+        self.assertFalse(os.path.lexists(cur / 'romfs.std'))
+        self.assertEqual((cur / 'romfs/a').read_bytes(), b'r')
+
+    @unittest.skipUnless(os.path.exists(os.path.expanduser('~/.dotnet/dotnet')) or __import__('shutil').which('dotnet'), '建标准 RomFS 镜像要 dotnet（services/romfs_index --std）')
+    def test_layout_on_image_only_root_writes_overlay_only(self):
+        # 产物根只有 RomFS 镜像 romfs.std（LibHac 从夹具目录建）。期望按夹具手写：覆盖层只有镜像里有的 Layout/one（= 覆盖包那份）、Layout/zz 镜像里没有 → 跳过；
+        #   清单只列 one；镜像逐字节不动、不建 romfs/
+        import shutil, subprocess
+        tree = self.home / 'tree'; (tree / 'Layout').mkdir(parents=True)
+        (tree / 'Layout/one').write_bytes(b'original one'); (tree / 'Layout/two').write_bytes(b'original two')
+        roots.remove_owned(self.source / 'romfs'); image = self.source / 'romfs.std'; image.write_bytes(b'')
+        env = dict(os.environ, DOTNET_ROOT=os.environ.get('DOTNET_ROOT', os.path.expanduser('~/.dotnet')))
+        env['PATH'] = env['DOTNET_ROOT'] + os.pathsep + env['PATH']
+        import shlex
+        from pack import img
+        tool = img.default_romfs_index()   # 正式出包同一个取法：Windows 发版件是预编的 romfs_index.exe，开发树走 services/romfs_index.sh
+        if os.name == 'nt' and tool.startswith('bash '):
+            self.skipTest('Windows 开发树没有预编 romfs_index.exe（S2A_PREBUILT_TOOLS）；bash 可能是 WSL 的、认不了 Windows 路径')
+        r = subprocess.run([*shlex.split(tool), '--std', str(tree), '-', str(image), '0'], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        blob = image.read_bytes()
+        refresh.seed(self.store, '原创', self.source)
+        overlay, _ = self._layout_cache()
+        (overlay / 'romfs/Layout/one').write_bytes(b'widen one'); (overlay / 'romfs/Layout/zz').write_bytes(b'not in image')
+        with contextlib.redirect_stderr(io.StringIO()):
+            stages.Stages(self.store).execute('原创', 'uilayout')
+        current = self.store.cur('原创')
+        got = sorted(p.relative_to(current / 'ui_overlay/romfs').as_posix() for p in (current / 'ui_overlay/romfs').rglob('*') if p.is_file())
+        self.assertEqual(got, ['Layout/one'])
+        self.assertEqual((current / 'ui_overlay/romfs/Layout/one').read_bytes(), b'widen one')
+        self.assertEqual((current / 'ui_overlay.tsv').read_bytes(), b'Layout/one\n')
+        self.assertEqual((current / 'romfs.std').read_bytes(), blob)
+        self.assertFalse(os.path.lexists(current / 'romfs'))
+
     def test_layout_rejects_persisted_traversal_before_transaction(self):
         refresh.seed(self.store, '原创', self.source)
         tx = self.store.begin('原创', self.store.tag('原创', 'unsafe-list'))
@@ -337,7 +452,7 @@ class LightTest(unittest.TestCase):
         (repo / files[0]).write_text(script, encoding='utf-8', newline='\n')
         layout = self.source / 'romfs/Layout'
         layout.mkdir(exist_ok=True)
-        (layout / 'one').write_bytes(b'original layout input')
+        replace_bytes(layout / 'one', b'original layout input')
         return repo, files, counter
 
     def test_layout_imports_and_native_decoder_change_both_cache_and_stage_keys(self):
@@ -634,6 +749,40 @@ class LightTest(unittest.TestCase):
         self.assertEqual((output / 'aoc.tsv').read_bytes(), b'idx\ttitle_id\tversion\tfiles\tbytes\n2\t0100000000002002\t0\t1\t4\n')
         self.assertIn(b'bad.nsp', (output / 'aoc.log').read_bytes())
         self.assertFalse((output / 'exefs').exists())
+
+
+class WindowsBashTest(unittest.TestCase):
+    """#26：PATH 第一个 bash 是 WSL 存根。手算期望：存根不选；存根的 UTF-16 输出（非 0 退出 / 带 \\x00）不能进配置值"""
+
+    def test_stub_is_rejected_and_real_bash_preferred(self):
+        from pack.orch import bash as B
+        stub = r'C:\Windows\System32\bash.exe'
+        git = r'C:\Program Files\Git\bin\bash.exe'
+        ship = r'C:\S2Arm\Runtime\git\usr\bin\bash.exe'
+        self.assertTrue(B.is_wsl_stub(stub))
+        self.assertFalse(B.is_wsl_stub(git))
+        with mock.patch.object(B.shutil, 'which', return_value=stub), mock.patch.object(B.os.path, 'isfile', return_value=True):
+            self.assertEqual(B.find_bash({'S2A_BASH': ship}, nt=True), ship)     # 随包 bash 最优先
+            self.assertEqual(B.find_bash({}, nt=True), git)                      # 没有随包的用 Git Bash
+        with mock.patch.object(B.shutil, 'which', return_value=stub), mock.patch.object(B.os.path, 'isfile', side_effect=lambda p: p == stub):
+            self.assertIsNone(B.find_bash({}, nt=True))                          # 只有存根 = 没有 bash
+
+    def test_machine_cfg_ignores_stub_output(self):
+        from pack.orch import stages as S
+        stub_out = '\x00'.join('The attempted operation')
+        for rc, out in ((1, stub_out), (0, stub_out)):
+            S._MACHINE_CFG.clear()   # 进程内缓存（同一进程同一项只问一次）：换模拟返回值前清掉
+            with mock.patch.object(S, 'find_bash', return_value='bash'), \
+                 mock.patch.object(S.subprocess, 'run', return_value=mock.Mock(returncode=rc, stdout=out)):
+                self.assertEqual(S.machine_cfg({}, 'S2A_COMMUNITY_DIR'), '')
+        S._MACHINE_CFG.clear()
+        with mock.patch.object(S, 'find_bash', return_value='bash'), \
+             mock.patch.object(S.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='/data\n')) as run:
+            self.assertEqual(S.machine_cfg({}, 'S2A_COMMUNITY_DIR'), '/data')    # 正常值原样返回
+            self.assertEqual(S.machine_cfg({}, 'S2A_COMMUNITY_DIR'), '/data')    # 再问一次：读缓存
+            self.assertEqual(run.call_count, 1)                                     # 11-16：同一进程只起一次 bash
+            self.assertEqual(S.machine_cfg({'S2A_COMMUNITY_DIR': '/env'}, 'S2A_COMMUNITY_DIR'), '/env')   # 环境里给了就用环境的，不看缓存
+        S._MACHINE_CFG.clear()
 
 
 if __name__ == '__main__':

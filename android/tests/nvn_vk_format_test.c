@@ -8,7 +8,7 @@ int main(void) {
     struct { uint32_t nvn; VkFormat vk; const char *name; } cases[] = {
         { NVN_FORMAT_RGBA8, VK_FORMAT_R8G8B8A8_UNORM, "RGBA8" },
         { NVN_FORMAT_RGBA8_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "RGBA8_SRGB" },
-        { NVN_FORMAT_RGB565, VK_FORMAT_R5G6B5_UNORM_PACK16, "RGB565" },
+        { NVN_FORMAT_RGB565, VK_FORMAT_B5G6R5_UNORM_PACK16, "RGB565" },   // #975：NVN 低位起，r 在 0–4 位
         { NVN_FORMAT_DEPTH24_STENCIL8, VK_FORMAT_D24_UNORM_S8_UINT, "D24S8" },
         { NVN_FORMAT_RGBA16F, VK_FORMAT_R16G16B16A16_SFLOAT, "RGBA16F" },
         { NVN_FORMAT_RGB_DXT1, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "DXT1" },
@@ -52,7 +52,7 @@ int main(void) {
         { NVN_FORMAT_RGBX32F, VK_FORMAT_R32G32B32A32_SFLOAT, "RGBX32F" },
         { NVN_FORMAT_RGBX8UI, VK_FORMAT_R8G8B8A8_UINT, "RGBX8UI" },
         // BGR 族：NVN 低位往上 r,g,b,a，与 Vulkan 的 BGR 打包一一对应。
-        { NVN_FORMAT_BGR565, VK_FORMAT_B5G6R5_UNORM_PACK16, "BGR565" },
+        { NVN_FORMAT_BGR565, VK_FORMAT_R5G6B5_UNORM_PACK16, "BGR565" },   // #975：b 在 0–4 位、r 在 11–15 位
         { NVN_FORMAT_BGRX8, VK_FORMAT_B8G8R8A8_UNORM, "BGRX8" },
         { NVN_FORMAT_BGRA8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, "BGRA8_SRGB" },
     };
@@ -100,6 +100,51 @@ int main(void) {
     if (nvn_vk_format_compressed_image_bytes(0xDEADu, 8, 8) != 0) {
         printf("block-bytes unknown -> nonzero FAIL\n");
         bad++;
+    }
+    // #398：设备缺 D24 深度附件（三星 Xclipse 只有 D16S8 / D32S8）时换 D32；有 D24 时一律原样。
+    {
+        const VkFormatFeatureFlags att = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        struct { VkFormatFeatureFlags d24s8, d32s8, x8d24, d32; uint32_t want; const char *name; } pick[] = {
+            { att, att, att, att, 0, "both D24 present" },
+            { 0, att, 0, att, NVN_VK_DEPTH_SUBST_D24S8 | NVN_VK_DEPTH_SUBST_X8D24, "Xclipse: no D24" },
+            { VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT, att, att, att, NVN_VK_DEPTH_SUBST_D24S8, "D24S8 sample-only" },
+            { 0, 0, 0, att, NVN_VK_DEPTH_SUBST_X8D24, "no D24S8 / D32S8: keep D24S8" },
+        };
+        for (unsigned i = 0; i < sizeof pick / sizeof pick[0]; i++) {
+            uint32_t got = nvn_vk_depth_subst_pick(pick[i].d24s8, pick[i].d32s8, pick[i].x8d24, pick[i].d32);
+            printf("depth-subst %-30s -> %u (want %u) %s\n", pick[i].name, got, pick[i].want, got == pick[i].want ? "ok" : "FAIL");
+            if (got != pick[i].want) bad++;
+        }
+        nvn_vk_format_set_depth_subst(NVN_VK_DEPTH_SUBST_D24S8 | NVN_VK_DEPTH_SUBST_X8D24);
+        VkFormat ds = nvn_vk_format(NVN_FORMAT_DEPTH24_STENCIL8), dd = nvn_vk_format(NVN_FORMAT_DEPTH24);
+        VkFormat dt = nvn_vk_tex_format(NVN_FORMAT_DEPTH24_STENCIL8), d16 = nvn_vk_format(NVN_FORMAT_DEPTH16);
+        int sub = nvn_vk_format_substituted(NVN_FORMAT_DEPTH24_STENCIL8) && nvn_vk_format_substituted(NVN_FORMAT_DEPTH24) &&
+                  !nvn_vk_format_substituted(NVN_FORMAT_DEPTH32F_STENCIL8) && !nvn_vk_format_substituted(NVN_FORMAT_DEPTH16);
+        int okm = ds == VK_FORMAT_D32_SFLOAT_S8_UINT && dd == VK_FORMAT_D32_SFLOAT && dt == VK_FORMAT_D32_SFLOAT_S8_UINT &&
+                  d16 == VK_FORMAT_D16_UNORM && sub;
+        printf("depth-subst on: D24S8 -> %d, D24 -> %d, tex D24S8 -> %d, D16 -> %d, substituted flags %d %s\n",
+               (int)ds, (int)dd, (int)dt, (int)d16, sub, okm ? "ok" : "FAIL");
+        if (!okm) bad++;
+        nvn_vk_format_set_depth_subst(0);
+        okm = nvn_vk_format(NVN_FORMAT_DEPTH24_STENCIL8) == VK_FORMAT_D24_UNORM_S8_UINT &&
+              nvn_vk_format(NVN_FORMAT_DEPTH24) == VK_FORMAT_X8_D24_UNORM_PACK32 &&
+              !nvn_vk_format_substituted(NVN_FORMAT_DEPTH24_STENCIL8);
+        printf("depth-subst off: back to D24 %s\n", okm ? "ok" : "FAIL");
+        if (!okm) bad++;
+        // 深度面换算：D24（低 24 位 UNORM，高 8 位不参与）→ float → D24 往返不丢值；越界 / NaN 夹到 [0,1]。
+        uint32_t t[5] = { 0x00000000u, 0x00ffffffu, 0xab800000u, 0x00123456u, 0x7f000001u };
+        const uint32_t back[5] = { 0x00000000u, 0x00ffffffu, 0x00800000u, 0x00123456u, 0x00000001u };
+        nvn_vk_depth24_to_f32(t, 5);
+        float f[5]; memcpy(f, t, sizeof f);
+        int okc = f[0] == 0.0f && f[1] == 1.0f && f[2] > 0.5f && f[2] < 0.5001f;
+        nvn_vk_depth_f32_to_24(t, 5);
+        for (int i = 0; i < 5; i++) okc = okc && t[i] == back[i];
+        float edge[3] = { -0.5f, 2.0f, 0.0f }; edge[2] = edge[2] / edge[2];   // NaN
+        nvn_vk_depth_f32_to_24(edge, 3);
+        uint32_t eu[3]; memcpy(eu, edge, sizeof eu);
+        okc = okc && eu[0] == 0 && eu[1] == 0x00ffffffu && eu[2] == 0;
+        printf("depth24 <-> f32 round trip %s\n", okc ? "ok" : "FAIL");
+        if (!okc) bad++;
     }
     VkFormat unk = nvn_vk_format(0xDEADu);
     printf("unknown 0xDEAD -> %d (want %d) %s\n", (int)unk, (int)VK_FORMAT_UNDEFINED, unk == VK_FORMAT_UNDEFINED ? "ok" : "FAIL");
@@ -158,26 +203,126 @@ int main(void) {
                rc != 0 ? "ok" : "FAIL");
         if (rc == 0) bad++;
     }
+    // #975：16 位打包格式的贴图映射。期望值不用被测表：NVN 位段按「低位起」手写，Vulkan 各 PACK16 格式的
+    // 分量位段按规范手写（首名分量在最高位），逐分量核「NVN 的 c 分量 = 所选 Vulkan 格式第 map[c] 个分量」位段相同。
+    // 两种路由都核：mask 0（全精确格式）与 mask 全 1（有退回的都走退回 + 通道补偿）。
+    {
+        struct p16f { uint32_t nvn; int lo[4], bits[4]; const char *name; };   // bits 0 = 没有该分量
+        static const struct p16f nvnf[] = {
+            { NVN_FORMAT_RGBA4,  {0, 4, 8, 12},  {4, 4, 4, 4}, "RGBA4" },
+            { NVN_FORMAT_RGB5,   {0, 5, 10, 0},  {5, 5, 5, 0}, "RGB5" },
+            { NVN_FORMAT_RGB5A1, {0, 5, 10, 15}, {5, 5, 5, 1}, "RGB5A1" },
+            { NVN_FORMAT_RGB565, {0, 5, 11, 0},  {5, 6, 5, 0}, "RGB565" },
+            { NVN_FORMAT_BGR565, {11, 5, 0, 0},  {5, 6, 5, 0}, "BGR565" },
+            { NVN_FORMAT_BGR5,   {10, 5, 0, 0},  {5, 5, 5, 0}, "BGR5" },
+            { NVN_FORMAT_BGR5A1, {10, 5, 0, 15}, {5, 5, 5, 1}, "BGR5A1" },
+            { NVN_FORMAT_A1BGR5, {11, 6, 1, 0},  {5, 5, 5, 1}, "A1BGR5" },
+        };
+        // Vulkan 分量 R,G,B,A 的位段（规范 Formats 章：分量按名字从最高位往下排）。
+        struct vkf { VkFormat vk; int lo[4], bits[4]; };
+        static const struct vkf vkt[] = {
+            { VK_FORMAT_A4B4G4R4_UNORM_PACK16_EXT, {0, 4, 8, 12},  {4, 4, 4, 4} },
+            { VK_FORMAT_B4G4R4A4_UNORM_PACK16,     {4, 8, 12, 0},  {4, 4, 4, 4} },
+            { VK_FORMAT_R4G4B4A4_UNORM_PACK16,     {12, 8, 4, 0},  {4, 4, 4, 4} },
+            { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR, {0, 5, 10, 15}, {5, 5, 5, 1} },
+            { VK_FORMAT_A1R5G5B5_UNORM_PACK16,     {10, 5, 0, 15}, {5, 5, 5, 1} },
+            { VK_FORMAT_R5G5B5A1_UNORM_PACK16,     {11, 6, 1, 0},  {5, 5, 5, 1} },
+            { VK_FORMAT_B5G5R5A1_UNORM_PACK16,     {1, 6, 11, 0},  {5, 5, 5, 1} },
+            { VK_FORMAT_R5G6B5_UNORM_PACK16,       {11, 5, 0, 0},  {5, 6, 5, 0} },
+            { VK_FORMAT_B5G6R5_UNORM_PACK16,       {0, 5, 11, 0},  {5, 6, 5, 0} },
+        };
+        int routes = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            nvn_vk_format_set_p16_fallback(pass ? 0xffu : 0u);
+            for (unsigned i = 0; i < sizeof nvnf / sizeof nvnf[0]; i++) {
+                VkFormat vk = nvn_vk_format(nvnf[i].nvn);
+                uint8_t map[4];
+                int remap = nvn_vk_format_chanmap(nvnf[i].nvn, map);
+                const struct vkf *t = NULL;
+                for (unsigned k = 0; k < sizeof vkt / sizeof vkt[0]; k++) if (vkt[k].vk == vk) t = &vkt[k];
+                int ok = t != NULL;
+                for (int c = 0; ok && c < 4; c++) {
+                    if (!nvnf[i].bits[c]) continue;   // NVN 没有的分量（565 的 a、RGB5 的 a）不核位段
+                    if (map[c] > 3 || t->lo[map[c]] != nvnf[i].lo[c] || t->bits[map[c]] != nvnf[i].bits[c]) ok = 0;
+                }
+                printf("p16 %-7s %s -> vk %d remap %d map %u%u%u%u %s\n", nvnf[i].name, pass ? "fallback" : "exact   ",
+                       (int)vk, remap, map[0], map[1], map[2], map[3], ok ? "ok" : "FAIL");
+                if (!ok) bad++;
+                routes += remap;
+            }
+        }
+        nvn_vk_format_set_p16_fallback(0);
+        // 有退回格式的 5 项（RGBA4 / RGB5 / RGB5A1 / RGB565 / A1BGR5）在 mask 全 1 时都必须走补偿；mask 0 时一项都不走。
+        printf("p16 remap routes = %d (want 5) %s\n", routes, routes == 5 ? "ok" : "FAIL");
+        if (routes != 5) bad++;
+        // 路由判定：精确格式不能采样、退回格式能采样才退；两边都不能采样不退（照精确格式报能力，由调用方报红）。
+        VkFormatFeatureFlags ex[NVN_VK_P16_N], fb[NVN_VK_P16_N];
+        const VkFormatFeatureFlags S = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        for (int i = 0; i < NVN_VK_P16_N; i++) { ex[i] = S; fb[i] = S; }
+        uint32_t m0 = nvn_vk_p16_fallback_pick(ex, fb);
+        for (int i = 0; i < NVN_VK_P16_N; i++) ex[i] = 0;
+        uint32_t m1 = nvn_vk_p16_fallback_pick(ex, fb);
+        for (int i = 0; i < NVN_VK_P16_N; i++) fb[i] = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+        uint32_t m2 = nvn_vk_p16_fallback_pick(ex, fb);
+        uint32_t want1 = 0;
+        for (int i = 0; i < NVN_VK_P16_N; i++) { VkFormat f; nvn_vk_p16_entry(i, NULL, NULL, &f); if (f != VK_FORMAT_UNDEFINED) want1 |= 1u << i; }
+        int ok = m0 == 0 && m1 == want1 && want1 == 0x8fu && m2 == 0 && !nvn_vk_p16_entry(NVN_VK_P16_N, NULL, NULL, NULL);
+        printf("p16 pick: exact-ok 0x%x, exact-missing 0x%x (want 0x8f), fallback-unsampled 0x%x %s\n", m0, m1, m2, ok ? "ok" : "FAIL");
+        if (!ok) bad++;
+    }
     // CPU 顶点解码（设备无顶点获取能力的格式 / 必须解码的格式 → float4）位级对拍。
-    // sRGB 期望值 = 规范分段公式（(c+0.055)/1.055)^2.4 段；打包格式按 PACK16 位序（首名分量在最高位）。
-    // src 是小端字节序；exp 是 NVN 顶点取数语义（缺失分量补 (0,0,0,1)，RGB5/BGR5 的 bit0 是填充位）。
+    // sRGB 期望值 = 规范分段公式（(c+0.055)/1.055)^2.4 段；16 位打包格式按 NVN 低位起（#975：首名分量在最低位），
+    // 每格式逐个分量把该位段置满（再加一个最低位单比特），期望值按位段手算。
+    // src 是小端字节序；exp 是 NVN 顶点取数语义（缺失分量补 (0,0,0,1)，RGB5/BGR5 的 bit15 是填充位）。
     // 32 位 UI2F/I2F 期望 = C 整数→float 的 IEEE 就近舍入（2^24 以上向偶数取整），逐位核对。
     struct { uint32_t fmt; uint8_t src[16]; float exp[4]; int eb; const char *name; } dec[] = {
         { NVN_FORMAT_RGBA8_SRGB,  {0x00,0x80,0xFF,0x80}, {0.0f, 2.15860500e-01f, 1.0f, 128.0f*(1.0f/255.0f)}, 4, "RGBA8_SRGB" },
         { NVN_FORMAT_BGRA8_SRGB,  {0x80,0x00,0xFF,0x40}, {1.0f, 0.0f, 2.15860500e-01f, 64.0f*(1.0f/255.0f)}, 4, "BGRA8_SRGB" },
         { NVN_FORMAT_RGBX8_SRGB,  {0xFF,0x00,0x00,0x00}, {1.0f, 0.0f, 0.0f, 1.0f}, 4, "RGBX8_SRGB" },
         { NVN_FORMAT_BGRX8_SRGB,  {0x80,0x40,0xFF,0x00}, {1.0f, 5.12694584e-02f, 2.15860500e-01f, 1.0f}, 4, "BGRX8_SRGB" },
-        { NVN_FORMAT_RGBA4,       {0xF0,0xF0,0,0},       {1.0f, 0.0f, 1.0f, 0.0f}, 2, "RGBA4" },
-        { NVN_FORMAT_RGB5,        {0x00,0xF8,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "RGB5 padA" },
-        { NVN_FORMAT_RGB5A1,      {0x01,0xF8,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "RGB5A1 A=1" },
-        { NVN_FORMAT_RGB5A1,      {0x00,0xF8,0,0},       {1.0f, 0.0f, 0.0f, 0.0f}, 2, "RGB5A1 A=0" },
-        { NVN_FORMAT_RGB565,      {0x00,0xF8,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "RGB565 R" },
-        { NVN_FORMAT_RGB565,      {0xE0,0x07,0,0},       {0.0f, 1.0f, 0.0f, 1.0f}, 2, "RGB565 G" },
-        { NVN_FORMAT_BGR565,      {0x1F,0x00,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "BGR565 R" },
-        { NVN_FORMAT_BGR565,      {0x00,0xF8,0,0},       {0.0f, 0.0f, 1.0f, 1.0f}, 2, "BGR565 B" },
-        { NVN_FORMAT_BGR5,        {0x00,0xF8,0,0},       {0.0f, 0.0f, 1.0f, 1.0f}, 2, "BGR5 padA" },
-        { NVN_FORMAT_BGR5A1,      {0x01,0xF8,0,0},       {0.0f, 0.0f, 1.0f, 1.0f}, 2, "BGR5A1" },
-        { NVN_FORMAT_A1BGR5,      {0xE0,0x83,0,0},       {0.0f, 1.0f, 0.0f, 1.0f}, 2, "A1BGR5" },
+        // RGBA4：r0-3 g4-7 b8-11 a12-15
+        { NVN_FORMAT_RGBA4,       {0x0F,0x00,0,0},       {1.0f, 0.0f, 0.0f, 0.0f}, 2, "RGBA4 r" },
+        { NVN_FORMAT_RGBA4,       {0xF0,0x00,0,0},       {0.0f, 1.0f, 0.0f, 0.0f}, 2, "RGBA4 g" },
+        { NVN_FORMAT_RGBA4,       {0x00,0x0F,0,0},       {0.0f, 0.0f, 1.0f, 0.0f}, 2, "RGBA4 b" },
+        { NVN_FORMAT_RGBA4,       {0x00,0xF0,0,0},       {0.0f, 0.0f, 0.0f, 1.0f}, 2, "RGBA4 a" },
+        { NVN_FORMAT_RGBA4,       {0x01,0x00,0,0},       {1.0f / 15.0f, 0.0f, 0.0f, 0.0f}, 2, "RGBA4 r lsb" },
+        // RGB5：r0-4 g5-9 b10-14，bit15 填充（a 恒 1）
+        { NVN_FORMAT_RGB5,        {0x1F,0x00,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "RGB5 r" },
+        { NVN_FORMAT_RGB5,        {0xE0,0x03,0,0},       {0.0f, 1.0f, 0.0f, 1.0f}, 2, "RGB5 g" },
+        { NVN_FORMAT_RGB5,        {0x00,0x7C,0,0},       {0.0f, 0.0f, 1.0f, 1.0f}, 2, "RGB5 b" },
+        { NVN_FORMAT_RGB5,        {0x00,0x80,0,0},       {0.0f, 0.0f, 0.0f, 1.0f}, 2, "RGB5 pad" },
+        // RGB5A1：r0-4 g5-9 b10-14 a15
+        { NVN_FORMAT_RGB5A1,      {0x1F,0x00,0,0},       {1.0f, 0.0f, 0.0f, 0.0f}, 2, "RGB5A1 r" },
+        { NVN_FORMAT_RGB5A1,      {0xE0,0x03,0,0},       {0.0f, 1.0f, 0.0f, 0.0f}, 2, "RGB5A1 g" },
+        { NVN_FORMAT_RGB5A1,      {0x00,0x7C,0,0},       {0.0f, 0.0f, 1.0f, 0.0f}, 2, "RGB5A1 b" },
+        { NVN_FORMAT_RGB5A1,      {0x00,0x80,0,0},       {0.0f, 0.0f, 0.0f, 1.0f}, 2, "RGB5A1 a" },
+        { NVN_FORMAT_RGB5A1,      {0x20,0x00,0,0},       {0.0f, 1.0f / 31.0f, 0.0f, 0.0f}, 2, "RGB5A1 g lsb" },
+        // RGB565：r0-4 g5-10 b11-15
+        { NVN_FORMAT_RGB565,      {0x1F,0x00,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "RGB565 r" },
+        { NVN_FORMAT_RGB565,      {0xE0,0x07,0,0},       {0.0f, 1.0f, 0.0f, 1.0f}, 2, "RGB565 g" },
+        { NVN_FORMAT_RGB565,      {0x00,0xF8,0,0},       {0.0f, 0.0f, 1.0f, 1.0f}, 2, "RGB565 b" },
+        { NVN_FORMAT_RGB565,      {0x20,0x00,0,0},       {0.0f, 1.0f / 63.0f, 0.0f, 1.0f}, 2, "RGB565 g lsb" },
+        // BGR565：b0-4 g5-10 r11-15
+        { NVN_FORMAT_BGR565,      {0x1F,0x00,0,0},       {0.0f, 0.0f, 1.0f, 1.0f}, 2, "BGR565 b" },
+        { NVN_FORMAT_BGR565,      {0xE0,0x07,0,0},       {0.0f, 1.0f, 0.0f, 1.0f}, 2, "BGR565 g" },
+        { NVN_FORMAT_BGR565,      {0x00,0xF8,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "BGR565 r" },
+        { NVN_FORMAT_BGR565,      {0x00,0x08,0,0},       {1.0f / 31.0f, 0.0f, 0.0f, 1.0f}, 2, "BGR565 r lsb" },
+        // BGR5：b0-4 g5-9 r10-14，bit15 填充
+        { NVN_FORMAT_BGR5,        {0x1F,0x00,0,0},       {0.0f, 0.0f, 1.0f, 1.0f}, 2, "BGR5 b" },
+        { NVN_FORMAT_BGR5,        {0xE0,0x03,0,0},       {0.0f, 1.0f, 0.0f, 1.0f}, 2, "BGR5 g" },
+        { NVN_FORMAT_BGR5,        {0x00,0x7C,0,0},       {1.0f, 0.0f, 0.0f, 1.0f}, 2, "BGR5 r" },
+        { NVN_FORMAT_BGR5,        {0x00,0x80,0,0},       {0.0f, 0.0f, 0.0f, 1.0f}, 2, "BGR5 pad" },
+        // BGR5A1：b0-4 g5-9 r10-14 a15
+        { NVN_FORMAT_BGR5A1,      {0x1F,0x00,0,0},       {0.0f, 0.0f, 1.0f, 0.0f}, 2, "BGR5A1 b" },
+        { NVN_FORMAT_BGR5A1,      {0xE0,0x03,0,0},       {0.0f, 1.0f, 0.0f, 0.0f}, 2, "BGR5A1 g" },
+        { NVN_FORMAT_BGR5A1,      {0x00,0x7C,0,0},       {1.0f, 0.0f, 0.0f, 0.0f}, 2, "BGR5A1 r" },
+        { NVN_FORMAT_BGR5A1,      {0x00,0x80,0,0},       {0.0f, 0.0f, 0.0f, 1.0f}, 2, "BGR5A1 a" },
+        // A1BGR5：a0 b1-5 g6-10 r11-15
+        { NVN_FORMAT_A1BGR5,      {0x01,0x00,0,0},       {0.0f, 0.0f, 0.0f, 1.0f}, 2, "A1BGR5 a" },
+        { NVN_FORMAT_A1BGR5,      {0x3E,0x00,0,0},       {0.0f, 0.0f, 1.0f, 0.0f}, 2, "A1BGR5 b" },
+        { NVN_FORMAT_A1BGR5,      {0xC0,0x07,0,0},       {0.0f, 1.0f, 0.0f, 0.0f}, 2, "A1BGR5 g" },
+        { NVN_FORMAT_A1BGR5,      {0x00,0xF8,0,0},       {1.0f, 0.0f, 0.0f, 0.0f}, 2, "A1BGR5 r" },
+        { NVN_FORMAT_A1BGR5,      {0x02,0x00,0,0},       {0.0f, 0.0f, 1.0f / 31.0f, 0.0f}, 2, "A1BGR5 b lsb" },
         { NVN_FORMAT_RGB9E5F,     {0x00,0x01,0x01,0x79}, {0.5f, 0.25f, 0.125f, 1.0f}, 4, "RGB9E5F" },
         // 32 位 UI2F/I2F：0 / 最大值 / 负数 / 2^24 以上精度边界，逐位对拍。
         { NVN_FORMAT_R32_UI2F,    {0,0,0,0},           {0.0f, 0.0f, 0.0f, 1.0f}, 4, "R32_UI2F 0" },

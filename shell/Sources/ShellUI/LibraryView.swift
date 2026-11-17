@@ -1,3 +1,5 @@
+#if !os(tvOS)   // tvOS 不编本文件：iOS 库界面与自绘焦点引擎（电视用系统焦点）（电视版库界面见 TVLibraryView.swift，UPSTREAM.md「我方改动」）
+// S2Arm modification: present a dedicated sorting list and guard background library input while it is open.
 import SwiftUI
 
 /// How the library arranges itself. Only the available size decides, never the device model or orientation,
@@ -16,13 +18,22 @@ enum ShellLayout: Equatable {
         return regular && !accessibilityText ? .grid : .column
     }
 
-    /// The width of the overlay Settings and Controllers share: a panel from the trailing edge over the dimmed library.
+    /// The widest the overlay Settings and Controllers get: a panel from the trailing edge over the dimmed library.
     static let overlayWidth: CGFloat = 520
+    /// Fork difference (kept across upstream syncs): a landscape panel on a phone is capped well under the 520,
+    /// following the NX2/GameCase rule — at the full width it took three fifths of the screen and its rows
+    /// stretched. `width` here is the safe-area width, so this is min(520, screen width × 0.44 less the safe
+    /// area); tablets and regular windows keep the 520.
+    func overlayWidth(_ width: CGFloat) -> CGFloat {
+        if case .coverFlow(let regular) = self, !regular { return min(Self.overlayWidth, width * 0.44) }
+        return Self.overlayWidth
+    }
     /// Settings drop in as that overlay wherever the library stays in view beside it (at least 120 points of it), and
     /// take the whole screen where it would not: a phone held upright, a folded foldable, a narrow window.
+    /// The float threshold stays on the 520 cap, as before.
     func settingsFloat(_ width: CGFloat) -> Bool { self != .column && width >= Self.overlayWidth + 120 }
     /// The settings' width: the overlay, or the whole width.
-    func paneWidth(_ width: CGFloat) -> CGFloat { settingsFloat(width) ? min(width, Self.overlayWidth) : width }
+    func paneWidth(_ width: CGFloat) -> CGFloat { settingsFloat(width) ? min(width, overlayWidth(width)) : width }
     var isCoverFlow: Bool { if case .coverFlow = self { true } else { false } }
 }
 
@@ -64,6 +75,7 @@ public struct LibraryView: View {
     /// How far the left-edge swipe has dragged the open settings or Controllers to the right.
     @State private var edgeDrag: CGFloat = 0
     @State private var libraryPosition = ScrollPosition()
+    @State private var gameOrderOpen = false
     @State private var layout: ShellLayout = .column
     @State private var returnFocus: String?
     /// The device that sent the last input, for the glyphs.
@@ -77,6 +89,8 @@ public struct LibraryView: View {
     /// The side column of iPhone Duo (#622): the captures set it, otherwise the system's values from SideBarProbe.
     @Environment(\.shellSideBar) private var sideBarOverride
     @State private var probedSideBar = SideBar(edge: nil)
+    /// S2Arm (#623): the player chip, when the host has players; it takes a place in the side column too.
+    @Environment(\.shellPlayer) private var shellPlayer
 
     public init(games: [GameDetail], controllers: [ControllerInfo] = [], actions: ShellActions = ShellActions(),
                 input: ShellInputLog = ShellInputLog(), initialSelection: String? = nil, initialDetailOpen: Bool = false,
@@ -111,6 +125,8 @@ public struct LibraryView: View {
             let layout = ShellLayout.resolve(whole, accessibilityText: typeSize.isAccessibilitySize)
             let width = geometry.size.width
             let pane = layout.paneWidth(width)
+            // The Controllers and shell-settings overlays share the settings pane's width rule.
+            let overlay = min(width, layout.overlayWidth(width))
             // Settings only when asked for. A panel floats over the dimmed library where there is room, otherwise the
             // settings take the whole screen and the library steps out of the way.
             let floating = layout.settingsFloat(width)
@@ -118,19 +134,24 @@ public struct LibraryView: View {
             let panelOverLibrary = settingsOpen && floating
             // The chips go into the side column where the system has one. At the accessibility text sizes they stay in the header.
             let side = typeSize.isAccessibilitySize ? nil : (sideBarOverride ?? probedSideBar)
-                .place(screen: whole, insets: insets, top: games.isEmpty ? [] : SideBar.topHeights)
+                .place(screen: whole, insets: insets, bottom: shellPlayer == nil ? SideBar.heights : [SideBar.playerHeight] + SideBar.heights,
+                       top: games.isEmpty ? [] : SideBar.topHeights)
             let column = side?.bottom
             ZStack(alignment: .topLeading) {
                 if layout.isCoverFlow, let selected { CoverFlowBackdrop(game: selected.game) } else { ShellPalette.background.ignoresSafeArea() }
                 if games.isEmpty {
                     EmptyLibraryView()
-                        .overlay(alignment: .topTrailing) {
-                            if column == nil {
-                                HStack(spacing: 10) {
+                        .overlay(alignment: .top) {   // S2Arm: the version for screenshots and the player (#623), level with the chips
+                            HStack(spacing: 10) {
+                                LibraryVersionBadge().layoutPriority(-1)
+                                Spacer(minLength: 8)
+                                if column == nil {
+                                    PlayerChip()
                                     ControllerChip(count: controllers.count, action: openControllers)
                                     ShellSettingsChip(action: openShellSettings)
-                                }.padding(.top, 6).padding(.trailing, 16)
+                                }
                             }
+                            .frame(minHeight: 44).padding(.top, 6).padding(.leading, 24).padding(.trailing, 16)
                         }
                     if let column { sideChips(column, insets: insets) }
                 } else if let selected {
@@ -220,11 +241,11 @@ public struct LibraryView: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 }.zIndex(2) }
                 if controllersOpen { Group {
-                    Color.black.opacity(0.55 * (1 - min(1, edgeDrag / min(width, 520)))).ignoresSafeArea().accessibilityHidden(true)
+                    Color.black.opacity(0.55 * (1 - min(1, edgeDrag / overlay))).ignoresSafeArea().accessibilityHidden(true)
                         .onTapGesture { back() }
-                    ControllersView(controllers: controllers, onBack: back, padMap: globalPadMap)
+                    ControllersView(controllers: controllers, onBack: back, padMap: globalPadMap, showsMapping: actions.onGlobalPadMapChange != nil)
                         .accessibilityHidden(choice != nil || padMapping != nil || buttonTestOpen)
-                        .frame(width: min(width, 520))
+                        .frame(width: overlay)
                         .frame(maxHeight: .infinity)
                         .background { ShellPalette.background.ignoresSafeArea() }
                         .overlay(alignment: .leading) { Rectangle().fill(ShellPalette.hairline).frame(width: 1).ignoresSafeArea() }
@@ -234,10 +255,10 @@ public struct LibraryView: View {
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }.zIndex(3) }
                 if shellSettingsOpen { Group {
-                    Color.black.opacity(0.55 * (1 - min(1, edgeDrag / min(width, 520)))).ignoresSafeArea().accessibilityHidden(true)
+                    Color.black.opacity(0.55 * (1 - min(1, edgeDrag / overlay))).ignoresSafeArea().accessibilityHidden(true)
                         .onTapGesture { back() }
                     ShellSettingsView(actions: guardedActions, onClose: closeShellSettings)
-                        .frame(width: min(width, 520))
+                        .frame(width: overlay)
                         .frame(maxHeight: .infinity)
                         .background { ShellPalette.background.ignoresSafeArea() }
                         .overlay(alignment: .leading) { Rectangle().fill(ShellPalette.hairline).frame(width: 1).ignoresSafeArea() }
@@ -291,7 +312,7 @@ public struct LibraryView: View {
                 EdgeSwipeBack(enabled: (settingsOpen || controllersOpen || shellSettingsOpen) && choice == nil && helpGameID == nil && deleteGameID == nil
                                   && padMapping == nil && !buttonTestOpen && touchLayout == nil,
                               changed: { edgeDrag = $0 },
-                              ended: { finishEdgeSwipe(travel: $0, velocity: $1, span: controllersOpen || shellSettingsOpen ? min(width, 520) : pane) },
+                              ended: { finishEdgeSwipe(travel: $0, velocity: $1, span: controllersOpen || shellSettingsOpen ? overlay : pane) },
                               cancelled: cancelEdgeSwipe)
             }
             // Every target on screen. Which of them the D-pad reaches is decided when it is used (`isLive`), from the
@@ -316,7 +337,23 @@ public struct LibraryView: View {
         .environment(\.shellOpenButtonTest, { openButtonTest() })
         .environment(\.shellIgnoresPress, { [gate] in gate.isSystemEcho })
         .environment(\.shellShowHelp, { game in openHelp(game.id) })
-        .environment(\.shellAskDelete, { game in openDelete(game.id) })
+        .environment(\.shellAskDelete, actions.onDeleteGame == nil ? nil : { game in openDelete(game.id) })
+        .environment(\.shellManageSaves, guardedActions.onManageSaves)
+        .environment(\.shellOpenGameOrder, actions.onReorderGames == nil ? nil : {
+            guard libraryPressAllowed, noteTouch() else { return }
+            gameOrderOpen = true
+        })
+        #if os(iOS)
+        .fullScreenCover(isPresented: $gameOrderOpen) {
+            GameOrderView(games: games, reorder: actions.onReorderGames)
+                .preferredColorScheme(.dark)
+        }
+        #else
+        .sheet(isPresented: $gameOrderOpen) {
+            GameOrderView(games: games, reorder: actions.onReorderGames)
+                .preferredColorScheme(.dark)
+        }
+        #endif
         .environment(\.shellFocus, focus)
         .environment(\.shellInputDevice, device)
         .foregroundStyle(.white)
@@ -334,6 +371,8 @@ public struct LibraryView: View {
         // Y opens controllers.
         .focusable().focused($keyboardFocus).focusEffectDisabled()
         .onAppear { keyboardFocus = true }
+        // The host's Home Screen quick action Settings: the library's own settings, the same as its gear button
+        .onReceive(NotificationCenter.default.publisher(for: .shellOpenSettings)) { _ in openShellSettings() }
         .onAnyTouch { gate.touch() }
         .onKeyPress(.leftArrow) { handle(.left, from: .keyboard); return .handled }
         .onKeyPress(.rightArrow) { handle(.right, from: .keyboard); return .handled }
@@ -403,7 +442,16 @@ public struct LibraryView: View {
                             .padding(.horizontal, 24).padding(.top, 18).padding(.bottom, 32 + insets.bottom)
                             // A phone on its side: a readable column, not rows stretched across the whole width.
                             .frame(maxWidth: 640, alignment: .leading)
-                            .padding(.leading, insets.leading).padding(.trailing, insets.trailing)
+                            // A floating pane sits on the screen's trailing edge, so the window's trailing
+                            // safe inset is positional — the pane's own frame already ends at the safe edge,
+                            // and padding the content by that inset a second time stacks 59pt of dead space
+                            // on the trailing side only (device-measured: card margins 24 leading / 83
+                            // trailing). Inside a floating pane the horizontal margins are the content's
+                            // own 24 on both sides; the banner above still bleeds edge to edge with the
+                            // full insets. Full-screen panes keep the insets. (The same ruling GameCase's
+                            // settings column ships with.)
+                            .padding(.leading, floating ? 0 : insets.leading)
+                            .padding(.trailing, floating && !SensorEdge.onTrailing ? 0 : insets.trailing)   // 灵动岛转到右边时照扣，不然右侧开关被它盖住（SensorEdge）
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -451,20 +499,22 @@ public struct LibraryView: View {
         a.onPlay = { if !echo() { o.onPlay($0) } }
         a.onChange = { if !echo() { o.onChange($0, $1, $2) } }
         a.onPickGameData = { if !echo() { o.onPickGameData($0) } }
-        a.onUseAppData = { if !echo() { o.onUseAppData($0) } }
-        a.onPickCloudSaves = { if !echo() { o.onPickCloudSaves($0) } }
-        a.onDisableCloudSaves = { if !echo() { o.onDisableCloudSaves($0) } }
-        a.onResetDefaults = { if !echo() { o.onResetDefaults($0) } }
-        a.onShowLog = { if !echo() { o.onShowLog($0) } }
-        a.onAppUpdate = { if !echo() { o.onAppUpdate() } }
-        a.onPickShellData = { if !echo() { o.onPickShellData() } }
-        a.onPickShellCloud = { if !echo() { o.onPickShellCloud() } }
-        a.onUseShellCloud = { if !echo() { o.onUseShellCloud($0) } }
-        a.onClearShellData = { if !echo() { o.onClearShellData() } }
-        a.onClearShellCloud = { if !echo() { o.onClearShellCloud() } }
-        a.onGlobalPadMapChange = { if !echo() { o.onGlobalPadMapChange($0, $1) } }
-        a.onGlobalPadMapReset = { if !echo() { o.onGlobalPadMapReset() } }
-        a.onDeleteGame = { if !echo() { o.onDeleteGame($0, $1) } }
+        a.onUseAppData = o.onUseAppData.map { act in { if !echo() { act($0) } } }
+        a.onPickCloudSaves = o.onPickCloudSaves.map { act in { if !echo() { act($0) } } }
+        a.onDisableCloudSaves = o.onDisableCloudSaves.map { act in { if !echo() { act($0) } } }
+        a.onResetDefaults = o.onResetDefaults.map { act in { if !echo() { act($0) } } }
+        a.onShowLog = o.onShowLog.map { act in { if !echo() { act($0) } } }
+        a.onAppUpdate = o.onAppUpdate.map { act in { if !echo() { act() } } }
+        a.onPickShellData = o.onPickShellData.map { act in { if !echo() { act() } } }
+        a.onPickShellCloud = o.onPickShellCloud.map { act in { if !echo() { act() } } }
+        a.onUseShellCloud = o.onUseShellCloud.map { act in { if !echo() { act($0) } } }
+        a.onClearShellData = o.onClearShellData.map { act in { if !echo() { act() } } }
+        a.onClearShellCloud = o.onClearShellCloud.map { act in { if !echo() { act() } } }
+        a.onReportProblem = o.onReportProblem.map { act in { if !echo() { act() } } }
+        a.onGlobalPadMapChange = o.onGlobalPadMapChange.map { act in { if !echo() { act($0, $1) } } }
+        a.onGlobalPadMapReset = o.onGlobalPadMapReset.map { act in { if !echo() { act() } } }
+        a.onDeleteGame = o.onDeleteGame.map { act in { if !echo() { act($0, $1) } } }
+        a.onManageSaves = o.onManageSaves.map { act in { if !echo() { act($0) } } }
         return a
     }
     /// An action that did not come from a controller or key came from touch: hints and focus ring step back. False when
@@ -481,15 +531,17 @@ public struct LibraryView: View {
     /// Under a dialog or a panel no finger reaches the library (it takes no hits there), so a press on its buttons is the
     /// system's echo of a controller button, whatever the window says: a finger that came down elsewhere just before the
     /// echo (a tap in the settings pane right after A) ends the window, and Play behind the pane started the game.
-    private var libraryPressAllowed: Bool { FocusLayer.libraryTakesPress(fromShell: gate.handling, under: topLayer) }
+    private var libraryPressAllowed: Bool { !gameOrderOpen && FocusLayer.libraryTakesPress(fromShell: gate.handling, under: topLayer) }
     private func primary(_ detail: GameDetail) {
         guard libraryPressAllowed, noteTouch() else { return }
         if detail.game.state.needsHelp { openHelp(detail.id); return }
         switch detail.game.state {
         case .playable: actions.onPlay(detail.id)
         case .needsGameData: actions.onPickGameData(detail.id)
-        case .needsAppUpdate: actions.onAppUpdate()
-        case .broken: actions.onShowLog(detail.id)
+        case .needsAppUpdate: actions.onAppUpdate?()
+        case .needsGameUpdate, .needsGameReinstall: break   // needsHelp：上面已展开说明
+        case .broken: actions.onShowLog?(detail.id)
+        case .installing(let stage): if stage.phase == .failed { actions.onPlay(detail.id) }   // 重试解开；传着 / 解着按了不动
         }
     }
     private func select(_ id: String) {
@@ -545,7 +597,7 @@ public struct LibraryView: View {
         deleteGameID = nil
         settingsOpen = false
         focus.id = nil
-        actions.onDeleteGame(id, saves)
+        actions.onDeleteGame?(id, saves)
     }
     private func openChoice(_ request: ChoiceRequest) {
         guard noteTouch() else { return }
@@ -602,14 +654,14 @@ public struct LibraryView: View {
     private func pickPadValue(_ row: String, _ value: String) {
         guard noteTouch() else { return }
         guard let id = padMapping?.gameID else { return }
-        if id == ControllersView.mappingID { actions.onGlobalPadMapChange(row, value) } else { actions.onChange(id, row, value) }
+        if id == ControllersView.mappingID { actions.onGlobalPadMapChange?(row, value) } else { actions.onChange(id, row, value) }
         closePadRow()
     }
     private func resetPadMapping() {
         guard noteTouch() else { return }
         guard let id = padMapping?.gameID else { return }
         let global = id == ControllersView.mappingID
-        if global { actions.onGlobalPadMapReset() } else { actions.onChange(id, PadMappingRows.resetID, "") }
+        if global { actions.onGlobalPadMapReset?() } else { actions.onChange(id, PadMappingRows.resetID, "") }
         // Reset is disabled now: the focus goes to the swap, which is back at its default.
         focus.id = "map.swap." + (global ? "0" : PadMappingRows.follow)
     }
@@ -640,6 +692,10 @@ public struct LibraryView: View {
         gate.handling = true
         defer { gate.handling = false }
         if case .controller = source { gate.controller(action) }
+        if gameOrderOpen {
+            if action == .back { gameOrderOpen = false }
+            return
+        }
         // Every controller button belongs to the button test while it is open: it closes on B held, touch or Escape.
         if buttonTestOpen, case .controller = source { return }
         if device != source { device = source }
@@ -820,3 +876,4 @@ private struct CoverThumbnail: View {
         .accessibilityHidden(true)
     }
 }
+#endif   // !os(tvOS)

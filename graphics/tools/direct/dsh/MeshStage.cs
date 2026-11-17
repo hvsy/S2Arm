@@ -5,7 +5,7 @@
 //   字 0       本组工作组号（ISBERD 模式 0x78）：任务 = 本次绘制起始工作组号 + 线程组号；无任务的网格同
 //   INPUT      网格着色器读的、它的任务写的载荷（ISBERD 模式 0x38）。字 0 = 本组在其任务派生里的序号（硬件放的，包装填）
 //   输出       任务的载荷（0xb8）：字 1 = 要派生的网格工作组数，记录从 +0x10 起；
-//              或网格的属性（0xf8）：每 32 个顶点 / 32 个图元一块，每个分量 0x80 字节（一顶点或一图元一字），先 SPH OMAP 开的顶点分量、再逐图元 SPH 的
+//              或网格的属性（0xf8）：先全部顶点块（每 32 个顶点一块，SPH OMAP 开的顶点分量各 0x80 字节，一顶点一字），再全部图元块（每 32 个图元一块，逐图元 SPH 的分量各 0x80 字节）；大小按两者交错算的上界留（Memory），够放
 //   图元       网格的图元字节：+3 图元数（0x88），+4 起每三角形三个索引字节（0x80）
 // 接口约定：side-session-notes 22_网格着色接口约定.md（入口名、缓冲槽 29、反射字段）
 using System;
@@ -45,6 +45,15 @@ namespace S2A.Dsh
         public const int METAL_MAX_GRID = 1024;                                // 一个对象线程组能派生的网格线程组数
         public const int METAL_MAX_SHARED = 0x8000;                            // Metal 函数的线程组内存
         public const int FIRST_SLOT = 29;                                      // 宿主放「本次绘制起始工作组号」的缓冲槽（接口约定 3）
+        public const int METAL_MAX_PAYLOAD = 0x4000;                           // Metal 对象→网格载荷（object_data）上限 16 KB
+        public const int RELAY_SLOT = 27;                                      // 载荷中转缓冲的槽（对象 / 网格两表；同计算核溢出槽 SPILL_SLOT，网格表这一格是顶点流 11，宿主经 enc_r_vbuf 绑）
+        public const int RELAY_HEAD = 8;                                       // 中转缓冲头（字，宿主写）：[0] 网格片起点（字），[1] 本次绘制任务组数，[2] 每个任务组的网格片数（= 任务线程数）
+
+        /// <summary>载荷超 Metal 对象载荷上限：走设备内存中转（任务把载荷写进中转缓冲、object_data 只带任务组号；网格的阶段内存整段放中转缓冲里一片）。
+        ///   每个任务组留「任务线程数」片，派生数钳到它：NVN2 任务常见写法是每线程决定派不派一组、ballot + popcount 得派生数（07abb052：≤ 32），超出的组不画</summary>
+        public static bool Relay(MeshInfo i) => i.Payload > METAL_MAX_PAYLOAD;
+        /// <summary>中转时宿主要的大小（字）：一份载荷、一片网格阶段内存（都按 16 字节对齐；任务的片数 0）</summary>
+        public static (int PayloadWords, int SliceWords) RelayWords(MeshInfo i) => ((((i.Payload + 3) >> 2) + 3) & ~3, i.Kind == "ms" ? ((Memory(i).Size >> 2) + 3) & ~3 : 0);
 
         /// <summary>控制段阶段字节 → "ts" / "ms" / null</summary>
         public static string Kind(byte[] ctl) => ctl != null && ctl.Length > 0x56 ? ctl[0x56] switch { 6 => "ts", 7 => "ms", _ => null } : null;
@@ -79,7 +88,7 @@ namespace S2A.Dsh
         /// <summary>（翻译器要的阶段内存偏移：工作组号、输入、输出、图元字节；共享内存字节数）</summary>
         public static (int[] Lay, int Size) Memory(MeshInfo i)
         {
-            int outp = INPUT + ((i.Payload + 15) & ~15);
+            int outp = INPUT + (i.Kind == "ts" && Relay(i) ? 0 : (i.Payload + 15) & ~15);   // 任务不读输入（ISBERD 0x38）：中转时不再给它留载荷大小的输入区（11-12 一款体育游戏近海任务 07abb052：55824 → 27920 字节，回到 32 KB 内）
             if (i.Kind == "ts") return (new[] { WORKGROUP, INPUT, outp, outp + i.Payload }, outp + ((i.Payload + 3) & ~3));
             int blocks = (Math.Max(Math.Max(i.MaxV, i.MaxP), 1) + BLOCK - 1) / BLOCK;
             int prim = outp + blocks * Math.Max(i.Vertex.Count + i.Primitive.Count, 1) * BLOCK * 4;
@@ -156,12 +165,34 @@ namespace S2A.Dsh
             var (lay, _) = Memory(i);
             int thr = i.Threads, pay = (i.Payload + 3) >> 2;
             int wg = lay[0] >> 2, inp = lay[1] >> 2, outw = lay[2] >> 2, prim = lay[3];
+            bool relay = Relay(i);
+            var (payw, slicew) = RelayWords(i);   // 中转缓冲里一份载荷 / 一片网格阶段内存的字数：与反射给宿主的同一份（Dsh.cs mesh_relay_*）
+            string relayArg = $"device uint* dm_relay [[buffer({RELAY_SLOT})]]";
+            string bar = "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
             string start = $"    threadgroup spvUnsafeArray<uint, {words}> {mem};\n"
-                         + $"    for (uint i = {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n"
-                         + "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-            string head = $"struct dm_payload_t {{ uint w[{Math.Max(pay, 1)}]; }};\n";
+                         + $"    for (uint i = {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n" + bar;
+            string head = relay ? "struct dm_payload_t { uint tg; };\n" : $"struct dm_payload_t {{ uint w[{Math.Max(pay, 1)}]; }};\n";
+            if (relay && kind == "ms")
+            {
+                // 网格的阶段内存（载荷输入 + 属性 + 图元，39 KB 超 32 KB）整段放中转缓冲：片号 = 任务组号 × 任务线程数 + 本网格组在其任务派生里的序号（任务把派生数钳到线程数）。
+                //   同计算核溢出（gal_spill.c）：数组引用改 device、原子转型改 device、栅栏带 mem_device
+                src = src.Replace($"threadgroup spvUnsafeArray<uint, {words}>&", $"device spvUnsafeArray<uint, {words}>&").Replace("(threadgroup atomic_uint*)", "(device atomic_uint*)")
+                         .Replace("mem_flags::mem_threadgroup", "mem_flags::mem_device | mem_flags::mem_threadgroup");
+                bar = "    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n";
+                start = $"    device spvUnsafeArray<uint, {words}>& {mem} = *(device spvUnsafeArray<uint, {words}>*)(dm_relay + dm_relay[0] + (dm_payload.tg * dm_relay[2] + {tg}) * {slicew}u);\n"
+                      + $"    for (uint i = {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n" + bar;
+            }
             string sig = string.Join(", ", ps.Concat(extra));
             string first = $"constant uint* dm_first [[buffer({FIRST_SLOT})]]";   // 本次绘制起始工作组号，宿主绑（接口约定 3）
+            if (kind == "ts" && relay)
+                return src + "\n" + head
+                    + $"[[object]] void main0({sig}, object_data dm_payload_t& dm_payload [[payload]], mesh_grid_properties dm_grid, {first}, {relayArg})\n{{\n{start}"
+                    + $"    if ({lid} == 0u) {mem}[{wg}] = dm_first[0] + {tg};\n"
+                    + $"{bar}    {call}\n{bar}"
+                    + $"    bool dm_in = {tg} < dm_relay[1];\n"
+                    + $"    device uint* dm_p = dm_relay + {RELAY_HEAD}u + {tg} * {payw}u;\n"
+                    + $"    if (dm_in) for (uint i = {lid}; i < {pay}u; i += {thr}u) dm_p[i] = {mem}[{outw}u + i];\n"
+                    + $"    if ({lid} == 0u) {{ dm_payload.tg = {tg}; dm_grid.set_threadgroups_per_grid(uint3(dm_in ? min({mem}[{outw + 1}], {i.Threads}u) : 0u, 1u, 1u)); }}\n}}\n";
             if (kind == "ts")
                 return src + "\n" + head
                     + $"[[object]] void main0({sig}, object_data dm_payload_t& dm_payload [[payload]], mesh_grid_properties dm_grid, {first})\n{{\n{start}"
@@ -170,34 +201,41 @@ namespace S2A.Dsh
                     + $"    for (uint i = {lid}; i < {pay}u; i += {thr}u) dm_payload.w[i] = {mem}[{outw}u + i];\n"
                     + $"    if ({lid} == 0u) dm_grid.set_threadgroups_per_grid(uint3(min({mem}[{outw + 1}], {METAL_MAX_GRID}u), 1u, 1u));\n}}\n";
             if (i.MaxV > METAL_MAX_VERTICES || i.MaxP > METAL_MAX_PRIMITIVES) throw new DshError("mesh stage failed", $"ms: {i.MaxV} 顶点 / {i.MaxP} 图元超 Metal 网格上限（{METAL_MAX_VERTICES} / {METAL_MAX_PRIMITIVES}）");
-            int nv = i.Vertex.Count;
-            int stride = Math.Max(nv + i.Primitive.Count, 1) * BLOCK;   // 一块属性的字数
+            // 属性区（硬件排法，着色器本体自己按它算地址）：先全部顶点块（每 32 个顶点一块、只含顶点分量，块长 nv × 0x80），紧接全部图元块（每 32 个图元一块、
+            //   只含逐图元分量，块长 np × 0x80）。两者不交错：网格 192226654c410372（04008E001F098000 岛上植被，19 个顶点分量、3 个图元分量、160 顶点）本体写
+            //   顶点 (v >> 5) × 2432、图元 12160 + (p >> 5) × 384（12160 = 5 块 × 2432）。原先按「每块顶点 + 图元分量交错、块长 (nv + np) × 0x80」读回，
+            //   第 32 个起的顶点和全部图元属性都读错位置（植被出 NaN 成黑块）；没有逐图元分量时两种排法相同
+            int nv = i.Vertex.Count, np = i.Primitive.Count;
+            int vstride = Math.Max(nv, 1) * BLOCK, pstride = Math.Max(np, 1) * BLOCK;   // 一块的字数
+            int pbase = (Math.Max(i.MaxV, 1) + BLOCK - 1) / BLOCK * vstride;              // 图元块从全部顶点块之后起
             string[] Word(int?[] comps) => Enumerable.Range(0, 4).Select(k => comps[k] is int c ? $"{mem}[b + {c * BLOCK}u]" : null).ToArray();
             var vm = Members(i.Vertex);
-            var pm = Members(i.Primitive).Select(x => (x.N, x.Idx.Select(c => c is int ci ? (int?)(ci + nv) : null).ToArray())).ToList();
+            var pm = Members(i.Primitive);
             if (!vm.Any(x => x.N == null)) throw new DshError("mesh stage failed", "ms: SPH 没开位置分量");
             head += "struct dm_vertex_t {\n    float4 position [[position]];\n" + string.Concat(vm.Where(x => x.N != null).Select(x => $"    float4 a{x.N} [[user(locn{x.N})]];\n")) + "};\n"
                   + (pm.Count > 0 ? "struct dm_prim_t {\n" + string.Concat(pm.Select(x => $"    float4 p{x.N} [[user(locn{x.N})]];\n")) + "};\n" : "")
                   + $"using dm_mesh_t = metal::mesh<dm_vertex_t, {(pm.Count > 0 ? "dm_prim_t" : "void")}, {i.MaxV}, {i.MaxP}, metal::topology::triangle>;\n";
-            string Block(string v) => $"{outw}u + ({v} / {BLOCK}u) * {stride}u + {v} % {BLOCK}u";
+            string Block(string v) => $"{outw}u + ({v} / {BLOCK}u) * {vstride}u + {v} % {BLOCK}u";
+            string PBlock(string p) => $"{outw + pbase}u + ({p} / {BLOCK}u) * {pstride}u + {p} % {BLOCK}u";
             string sets = string.Concat(vm.Select(x => $"        v.{(x.N == null ? "position" : $"a{x.N}")} = {Component(Word(x.Idx))};\n"));
-            string psets = string.Concat(pm.Select(x => $"        p.p{x.N} = {Component(Word(x.Item2))};\n"));
+            string psets = string.Concat(pm.Select(x => $"        p.p{x.N} = {Component(Word(x.Idx))};\n"));
             string Entry(string name, bool gl)
             {
                 // 有任务时输入是载荷，字 0 = 本组在其任务派生里的序号（硬件放的；任务从 +4 起写，+0 不是它写的字）
                 string fill = i.Task
-                    ? $"    for (uint i = {lid}; i < {pay}u; i += {thr}u) {mem}[{inp}u + i] = dm_payload.w[i];\n"
-                      + "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                    ? (relay ? $"    for (uint i = {lid}; i < {pay}u; i += {thr}u) {mem}[{inp}u + i] = dm_relay[{RELAY_HEAD}u + dm_payload.tg * {payw}u + i];\n"
+                             : $"    for (uint i = {lid}; i < {pay}u; i += {thr}u) {mem}[{inp}u + i] = dm_payload.w[i];\n")
+                      + bar
                       + $"    if ({lid} == 0u) {{ {mem}[{wg}] = {tg}; {mem}[{inp}] = {tg}; }}\n"
                     : $"    if ({lid} == 0u) {mem}[{wg}] = dm_first[0] + {tg};\n";
-                return $"[[mesh]] void {name}({sig}, dm_mesh_t dm_out" + (i.Task ? ", const object_data dm_payload_t& dm_payload [[payload]]" : $", {first}") + $")\n{{\n{start}{fill}"
-                    + $"    threadgroup_barrier(mem_flags::mem_threadgroup);\n    {call}\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                return $"[[mesh]] void {name}({sig}, dm_mesh_t dm_out" + (i.Task ? ", const object_data dm_payload_t& dm_payload [[payload]]" : $", {first}") + (relay ? ", " + relayArg : "") + $")\n{{\n{start}{fill}"
+                    + $"{bar}    {call}\n{bar}"
                     + $"    uint np = min({mem}[{prim >> 2}] >> 24, {i.MaxP}u);\n"
                     + $"    if ({lid} == 0u) dm_out.set_primitive_count(np);\n"
                     + $"    for (uint n = {lid}; n < {i.MaxV}u; n += {thr}u)\n    {{\n        uint b = {Block("n")};\n        dm_vertex_t v;\n{sets}"
                     + (gl ? "        v.position.z = fma(v.position.z, 0.5, v.position.w * 0.5);\n" : "")
                     + "        dm_out.set_vertex(n, v);\n    }\n"
-                    + (pm.Count > 0 ? $"    for (uint n = {lid}; n < np; n += {thr}u)\n    {{\n        uint b = {Block("n")};\n        dm_prim_t p;\n{psets}        dm_out.set_primitive(n, p);\n    }}\n" : "")
+                    + (pm.Count > 0 ? $"    for (uint n = {lid}; n < np; n += {thr}u)\n    {{\n        uint b = {PBlock("n")};\n        dm_prim_t p;\n{psets}        dm_out.set_primitive(n, p);\n    }}\n" : "")
                     + $"    for (uint n = {lid}; n < np * 3u; n += {thr}u)\n    {{\n        uint at = {prim + 4}u + n;\n        dm_out.set_index(n, ({mem}[at >> 2] >> ((at & 3u) * 8u)) & 0xffu);\n    }}\n}}\n";
             }
             return src + "\n" + head + Entry("main0", true) + "\n" + Entry("main0_z", false);

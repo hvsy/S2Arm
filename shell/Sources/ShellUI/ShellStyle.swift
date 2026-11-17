@@ -31,6 +31,13 @@ enum ShellStrings {
 }
 
 @MainActor public enum ShellFonts {
+    /// 电视（tvOS）上界面按手机点数设计的尺寸放大多少：1920×1080 点、两三米外看，正文 15 → 27（tvOS 系统正文约 29）。
+    /// 字号（`font`）与几张卡片 / 页面的最大宽度乘它；iOS / macOS 为 1，尺寸不变
+    #if os(tvOS)
+    public nonisolated static let tvScale: CGFloat = 1.8
+    #else
+    public nonisolated static let tvScale: CGFloat = 1
+    #endif
     /// Register just the bundled font. No game or user files are accessed.
     private static let registered: Bool = {
         guard let url = Bundle.module.url(forResource: "Manrope", withExtension: "ttf") else { return false }
@@ -40,7 +47,7 @@ enum ShellStrings {
     }()
     /// Manrope that follows Dynamic Type.
     public static func font(_ size: CGFloat, weight: Font.Weight = .regular, relativeTo: Font.TextStyle = .body) -> Font {
-        if registered { return .custom("Manrope", size: size, relativeTo: relativeTo).weight(weight) }
+        if registered { return .custom("Manrope", size: size * tvScale, relativeTo: relativeTo).weight(weight) }
         return .system(relativeTo).weight(weight)
     }
     /// Manrope at a fixed size, for lettering that belongs to a picture rather than to the interface.
@@ -141,6 +148,7 @@ struct ShellButtonStyle: ButtonStyle {
             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.white.opacity(0.10)))
             .opacity(enabled ? 1 : 0.4)
             .contentShape(RoundedRectangle(cornerRadius: 9))
+            .tvFocusLift()
     }
 }
 
@@ -153,10 +161,26 @@ struct PrimaryPillStyle: ButtonStyle {
             .padding(.horizontal, 26).frame(minHeight: 50)
             .frame(maxWidth: expands ? .infinity : nil)
             .foregroundStyle(.black)
-            .background(ShellPalette.cream, in: Capsule())
+            .modifier(PrimarySurface())
             .opacity(configuration.isPressed ? 0.78 : 1)
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
             .contentShape(Capsule())
+            .tvFocusLift()
+    }
+}
+
+/// The primary action's surface: on iOS 26 / macOS 26 with Liquid Glass on, the system's regular glass
+/// tinted with the cream — the only tinted glass in the shell (GameCase #61's rule: tint for the one
+/// primary action); everywhere else the plain cream capsule it has always been.
+private struct PrimarySurface: ViewModifier {
+    // S2Arm：开关值用 @AppStorage 绑同一个键，设置里一切换就重画（原先在 body 里直接读 store，切了要等别的原因重画才变）
+    @AppStorage(ShellSettingsStore.liquidGlassKey, store: ShellSettingsStore.current.defaults) private var glass = true
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, macOS 26.0, tvOS 26.0, *), glass {
+            content.glassEffect(.regular.tint(ShellPalette.cream).interactive(), in: Capsule())
+        } else {
+            content.background(ShellPalette.cream, in: Capsule())
+        }
     }
 }
 
@@ -171,6 +195,7 @@ struct RoundIconButtonStyle: ButtonStyle {
             .background(active ? ShellPalette.cream : .white.opacity(configuration.isPressed ? 0.2 : 0.10), in: Circle())
             .overlay(Circle().strokeBorder(.white.opacity(active ? 0 : 0.14)))
             .contentShape(Circle())
+            .tvFocusLift()
     }
 }
 
@@ -180,14 +205,53 @@ struct ChipButtonStyle: ButtonStyle {
         configuration.label.shellText(13, .semibold, relativeTo: .footnote)
             .padding(.horizontal, 14).frame(minHeight: 44)
             .foregroundStyle(.white)
-            // Its own quiet backdrop: a blur and a dark tint, so it stays legible on any art.
-            .background {
-                Capsule().fill(.ultraThinMaterial)
-                    .overlay(Capsule().fill(.black.opacity(configuration.isPressed ? 0.62 : 0.5)))
-            }
+            .modifier(ChipSurface(isPressed: configuration.isPressed))
             .environment(\.colorScheme, .dark)
             .overlay(Capsule().strokeBorder(.white.opacity(0.14)))
             .contentShape(Capsule())
+            .tvFocusLift()
+    }
+}
+
+extension View {
+    /// tvOS：按钮被系统焦点选中时放大、提亮一点（自定义 ButtonStyle 在 tvOS 上没有系统的焦点效果）。iOS / macOS 原样返回
+    func tvFocusLift() -> some View {
+        #if os(tvOS)
+        modifier(TVFocusLift())
+        #else
+        self
+        #endif
+    }
+}
+
+#if os(tvOS)
+/// 读的是按钮自己的焦点（ButtonStyle 的 makeBody 在按钮里面，`isFocused` 指最近的可聚焦祖先，就是这个按钮）
+private struct TVFocusLift: ViewModifier {
+    @Environment(\.isFocused) private var focused
+    func body(content: Content) -> some View {
+        content.scaleEffect(focused ? 1.06 : 1).brightness(focused ? 0.08 : 0)
+            .shadow(color: .black.opacity(focused ? 0.45 : 0), radius: focused ? 18 : 0, y: focused ? 8 : 0)
+            .animation(.easeOut(duration: 0.15), value: focused)
+    }
+}
+#endif
+
+/// The chip's own quiet backdrop: on iOS 26 / macOS 26 with Liquid Glass on, the system's regular glass
+/// (GameCase #61's shape; no tint — a chip is never the primary action), interactive because the chip is
+/// tappable — a plain `.regular` glass can latch its press state when the press restructures the view;
+/// everywhere else the blur and dark tint it has always worn, so it stays legible on any art.
+private struct ChipSurface: ViewModifier {
+    let isPressed: Bool
+    @AppStorage(ShellSettingsStore.liquidGlassKey, store: ShellSettingsStore.current.defaults) private var glass = true   // 同 PrimarySurface
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, macOS 26.0, tvOS 26.0, *), glass {
+            content.glassEffect(.regular.interactive(), in: Capsule())
+        } else {
+            content.background {
+                Capsule().fill(.ultraThinMaterial)
+                    .overlay(Capsule().fill(.black.opacity(isPressed ? 0.62 : 0.5)))
+            }
+        }
     }
 }
 
@@ -318,17 +382,96 @@ struct CoverView: View {
     var body: some View {
         ArtView(game: game)
             .aspectRatio(16 / 9, contentMode: .fit)
+            .overlay { if case .installing(let stage) = game.state { InstallMask(stage: stage) } }
             .clipShape(RoundedRectangle(cornerRadius: radius))
             .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(.white.opacity(0.10)))
             .overlay(alignment: .topLeading) {
-                if showsState {
+                if showsState || game.sgrade {
                     GeometryReader { geometry in
                         let size = max(8, min(14, geometry.size.width * 0.034))
-                        StateDot(state: game.state, size: size).padding(size * 0.9)
+                        // 金色 S（v0.4.0）：这款打进了 S 级优化，放左上角；状态点跟在它右边
+                        HStack(alignment: .center, spacing: size * 0.6) {
+                            if game.sgrade { SGradeBadge(size: max(16, geometry.size.width * 0.085)) }
+                            if showsState { StateDot(state: game.state, size: size) }
+                        }
+                        .padding(size * 0.9)
                     }
                 }
             }
             .accessibilityHidden(true)
+    }
+}
+
+/// The blue dot iOS puts before a new app's name until it is first opened.
+struct NewDot: View {
+    var size: CGFloat = 9
+    var body: some View { Circle().fill(Color(red: 0.04, green: 0.52, blue: 1)).frame(width: size, height: size).accessibilityHidden(true) }
+}
+
+extension GameTile {
+    /// Ready and not opened since it was installed: says so once, under the name.
+    var showsNewNote: Bool { isNew && state == .playable }
+}
+
+/// An arriving game's grey veil, as iOS draws an app being installed: the grey clears clockwise from twelve o'clock as
+/// this phase gets on, and a stopped or failed install stays fully grey with a sign of what happened.
+struct InstallMask: View {
+    let stage: InstallStage
+    var body: some View {
+        GeometryReader { geometry in
+            let side = min(geometry.size.width, geometry.size.height)
+            ZStack {
+                RemainingPie(done: stage.phase == .interrupted || stage.phase == .failed ? 0 : stage.fraction ?? 0)
+                    .fill(Color.black.opacity(0.58))
+                    .animation(.linear(duration: 0.9), value: stage.fraction)
+                Circle().strokeBorder(.white.opacity(0.85), lineWidth: max(1.5, side * 0.02))
+                    .frame(width: side * 0.34, height: side * 0.34)
+                    .overlay {
+                        switch stage.phase {
+                        case .interrupted: Image(systemName: "pause.fill").font(.system(size: side * 0.12, weight: .bold))
+                        case .failed: Image(systemName: "exclamationmark").font(.system(size: side * 0.13, weight: .heavy))
+                        default: DonePie(fraction: stage.fraction ?? 0).fill(.white.opacity(0.85)).clipShape(Circle()).padding(side * 0.04)
+                                     .animation(.linear(duration: 0.9), value: stage.fraction)
+                        }
+                    }
+                    .foregroundStyle(.white.opacity(0.9))
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// The part of a full turn not yet done: a pie from `done` of the way round, clockwise from twelve o'clock, back to twelve.
+/// Its radius reaches the corners, so whatever it covers is covered edge to edge.
+struct RemainingPie: Shape {
+    var done: Double
+    var animatableData: Double { get { done } set { done = newValue } }
+    func path(in rect: CGRect) -> Path {
+        let c = CGPoint(x: rect.midX, y: rect.midY), r = hypot(rect.width, rect.height) / 2
+        let d = min(1, max(0, done))
+        var p = Path()
+        if d >= 1 { return p }
+        p.move(to: c)
+        p.addArc(center: c, radius: r, startAngle: .degrees(-90 + 360 * d), endAngle: .degrees(270), clockwise: false)
+        p.closeSubpath()
+        return p
+    }
+}
+
+/// The part of a full turn done: clockwise from twelve o'clock.
+struct DonePie: Shape {
+    var fraction: Double
+    var animatableData: Double { get { fraction } set { fraction = newValue } }
+    func path(in rect: CGRect) -> Path {
+        let c = CGPoint(x: rect.midX, y: rect.midY), r = hypot(rect.width, rect.height) / 2
+        let f = min(1, max(0, fraction))
+        var p = Path()
+        if f <= 0 { return p }
+        p.move(to: c)
+        p.addArc(center: c, radius: r, startAngle: .degrees(-90), endAngle: .degrees(-90 + 360 * f), clockwise: false)
+        p.closeSubpath()
+        return p
     }
 }
 
@@ -352,38 +495,88 @@ extension GameState {
         case .playable: ShellStrings.text("Ready to play")
         case .needsGameData: ShellStrings.text("Needs game data")
         case .needsAppUpdate: ShellStrings.text("App update needed")
+        case .needsGameUpdate: ShellStrings.text("Update on your computer")
+        case .needsGameReinstall: ShellStrings.text("Reinstall from your computer")
         case .broken(let reason, _, _): reason.isEmpty ? ShellStrings.text("Unavailable") : reason
+        case .installing(let stage):
+            switch stage.phase {
+            case .transferring: ShellStrings.text("Transferring – keep connected…") + Self.percent(stage.fraction)
+            case .installing: Self.stepTitle(stage.step) + Self.percent(stage.fraction)
+            case .interrupted: ShellStrings.text("Transfer stopped")
+            case .failed: ShellStrings.text("Install didn't finish")
+            }
         }
+    }
+    private static func stepTitle(_ step: Int) -> String {
+        switch step {
+        case 1: ShellStrings.text("Importing…")
+        case 2: ShellStrings.text("Unpacking small files…")
+        case 3: ShellStrings.text("Checking files…")
+        case 4: ShellStrings.text("Waiting for another game…")
+        case 5: ShellStrings.text("Organizing game folders…")
+        default: ShellStrings.text("Installing…")
+        }
+    }
+    private static func percent(_ fraction: Double?) -> String { fraction.map { " \(Int(($0 * 100).rounded(.down)))%" } ?? "" }
+    /// The phase of an arriving game; nil for any other state.
+    public var installPhase: InstallStage.Phase? { if case .installing(let stage) = self { return stage.phase }; return nil }
+    /// Being copied or unpacked: nothing to do but wait, so its primary action is shown but cannot be pressed.
+    var isArriving: Bool {
+        if case .installing(let stage) = self { return stage.phase == .transferring || stage.phase == .installing }
+        return false
     }
     var color: Color {
         switch self {
         case .playable: ShellPalette.ready
-        case .needsGameData, .needsAppUpdate: ShellPalette.attention
+        case .needsGameData, .needsAppUpdate, .needsGameUpdate, .needsGameReinstall: ShellPalette.attention
         case .broken: ShellPalette.muted
+        case .installing(let stage): stage.phase == .interrupted || stage.phase == .failed ? ShellPalette.attention : ShellPalette.muted
         }
     }
     var explanation: String {
         switch self {
         case .playable: ""
-        case .needsGameData: ShellStrings.text("Choose this game's data to get ready to play.")
+        case .needsGameData: ShellStrings.text("Choose this game's data to get ready to play. If it was installed from a computer, connect the iPhone and click “Install on iPhone” for this game in S2Arm: it picks up from what was already copied, so it won’t start over.")
         case .needsAppUpdate: ShellStrings.text("Install a newer version of this app to play this game.")
+        case .needsGameUpdate: ShellStrings.text("This game was built with an older S2Arm and doesn't match the new version on your phone, so it can't open. Connect your phone to your computer and click \"Update S2Arm on iPhone\" in S2Arm; this game will be rebuilt for the new version.")
+        case .needsGameReinstall: ShellStrings.text("This game's files on your phone didn't finish installing, or were installed from another computer or Apple ID, so they don't match S2Arm on this phone and it can't open. Connect your phone to your computer and click \"Install on iPhone\" for this game in S2Arm to reinstall it.")
         case .broken(_, let detail, _): detail
+        case .installing(let stage):
+            switch stage.phase {
+            case .transferring: ShellStrings.text("This game is being copied from your computer. Keep the cable connected.")
+            case .installing: ShellStrings.text("Getting this game ready. Keep this app open.")
+            case .interrupted: ShellStrings.text("Connect this iPhone to the computer, then click “Install on iPhone” for this game in S2Arm. It picks up from what was already copied, so it won’t start over.")
+            case .failed:
+                (stage.reason.map { $0 + "\n" } ?? "") + ShellStrings.text("Tap Try again. If it still does not finish, install it again from the computer.")
+            }
         }
     }
     var actionTitle: String {
         switch self {
         case .playable: ShellStrings.text("Play")
         case .needsGameData: ShellStrings.text("Choose game data…")
-        case .needsAppUpdate: ShellStrings.text("How to update")
+        case .needsAppUpdate, .needsGameUpdate, .needsGameReinstall: ShellStrings.text("How to update")
         case .broken: ShellStrings.text("How to fix")
+        case .installing(let stage):
+            switch stage.phase {
+            case .transferring, .installing: ShellStrings.text("Play")
+            case .interrupted: ShellStrings.text("How to continue")
+            case .failed: ShellStrings.text("Try again")
+            }
         }
     }
     var actionSymbol: String {
         switch self {
         case .playable: "play.fill"
         case .needsGameData: "folder"
-        case .needsAppUpdate: "arrow.up.circle"
+        case .needsAppUpdate, .needsGameUpdate, .needsGameReinstall: "arrow.up.circle"
         case .broken: "wrench.and.screwdriver"
+        case .installing(let stage):
+            switch stage.phase {
+            case .transferring, .installing: "play.fill"
+            case .interrupted: "cable.connector"
+            case .failed: "arrow.clockwise"
+            }
         }
     }
 }
@@ -464,14 +657,16 @@ extension GameState {
         switch self {
         case .playable: ShellStrings.text("Play")
         case .needsGameData: ShellStrings.text("Choose")
-        case .needsAppUpdate: ShellStrings.text("How to update")
+        case .needsAppUpdate, .needsGameUpdate, .needsGameReinstall: ShellStrings.text("How to update")
         case .broken: ShellStrings.text("How to fix")
+        case .installing: actionTitle
         }
     }
-    /// Broken and needs-an-update are fixed on the Mac. Their primary action explains how, instead of acting.
+    /// Broken, needs-an-update and a stopped transfer are fixed on the computer. Their primary action explains how, instead of acting.
     var needsHelp: Bool {
         switch self {
-        case .broken, .needsAppUpdate: true
+        case .broken, .needsAppUpdate, .needsGameUpdate, .needsGameReinstall: true
+        case .installing(let stage): stage.phase == .interrupted
         default: false
         }
     }

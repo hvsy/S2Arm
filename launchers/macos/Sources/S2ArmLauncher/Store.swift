@@ -3,6 +3,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import S2ArmAppleAdapter
 
 final class WorkerOutput: @unchecked Sendable {
     private let lock = NSLock()
@@ -21,6 +22,7 @@ final class WorkerOutput: @unchecked Sendable {
 @MainActor final class Store: ObservableObject {
     @Published var preferences = Preferences()
     @Published var games: [Game] = []
+    @Published var downstreamPrompt: Game?   // 下游深度方案确认页（DownstreamView.swift）：导出前弹，选完记下再接着导出
     @Published var tasks: [TaskRecord] = []
     @Published var checks: [ToolCheck] = []
     @Published var platformChecks: [String:[ToolCheck]] = [:]
@@ -54,7 +56,7 @@ final class WorkerOutput: @unchecked Sendable {
     @Published var installReadiness: InstallReadiness?
     @Published var installWhenReady = false
     var installCheckStarted: Date?
-    /// 选的游戏库位置在非 APFS 磁盘上：弹框说明并给改用默认位置 / 重选
+    /// 选的游戏库位置在不支持的磁盘格式上：弹框说明并给改用默认位置 / 重选
     @Published var libraryFormatProblem: LibraryFormatProblem?
     /// 导出页同时勾了 iPhone / iPad 和 Mac 的游戏：iPhone 版结束后接着排 Mac 版
     var macAfterIPA: Set<String> = []
@@ -189,8 +191,11 @@ final class WorkerOutput: @unchecked Sendable {
         if let overrideResources { resources = overrideResources }
         else if let r = Bundle.main.resourceURL, Bundle.main.bundleURL.pathExtension == "app" || FileManager.default.fileExists(atPath:r.appendingPathComponent("Jobs/main.py").path) { resources = r }
         else { resources = Store.sourceTree?.appendingPathComponent("launchers/macos") ?? Bundle.main.bundleURL }
-        try? FileManager.default.createDirectory(at:privateRoot,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+        try? FileManager.default.createDirectory(at:privateRoot,withIntermediateDirectories:true)
         if let data = try? Data(contentsOf:privateRoot.appendingPathComponent("preferences.json")), let p = try? JSONDecoder().decode(Preferences.self,from:data) { preferences = p }
+        // 旧默认库（私有目录里的「游戏库」）已被作业层同盘改名到 ~/S2Arm（layout.relocate_default）：设置跟着换，别当成库丢了
+        let moved = S2ArmPaths.library(privateRoot:privateRoot, saved:preferences.library)
+        if moved != preferences.library { preferences.library = moved; savePreferences() }
         forgetVanishedLibrary()
         if let data = try? Data(contentsOf:privateRoot.appendingPathComponent("default-input.json")), let p = try? JSONDecoder().decode(InputConfig.self,from:data) { globalInput = p }
         if let i = args.firstIndex(of:"--language"), args.count > i+1, let language = AppLanguage(rawValue:args[i+1]) {
@@ -211,7 +216,7 @@ final class WorkerOutput: @unchecked Sendable {
         DispatchQueue.main.async { [weak self] in if let self { ControlServer.start(store:self) } }
     }
     func recoverTasks() {
-        let paths = (try? FileManager.default.contentsOfDirectory(at:privateRoot.appendingPathComponent("jobs"),includingPropertiesForKeys:nil)) ?? []
+        let paths = (try? FileManager.default.contentsOfDirectory(at:jobsRoot,includingPropertiesForKeys:nil)) ?? []
         for path in paths where path.pathExtension == "json" {
             guard let data = try? Data(contentsOf:path), var obj = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let state = obj["state"] as? String else { continue }
             // 作业进程还活着（上次启动器卡死 / 被关，作业是独立进程照跑）：接管，按作业记录接着显示进度，不改成「中断」（10-26 Spare-host 内存吃紧启动器失联）
@@ -269,7 +274,6 @@ final class WorkerOutput: @unchecked Sendable {
     @discardableResult func persist(_ data: Data, to url: URL, _ what: String, privateFile: Bool = false) -> Bool {
         do {
             try data.write(to:url,options:.atomic)
-            if privateFile { try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:url.path) }
             return true
         } catch {
             self.error="\(what)没能写进磁盘（\(error.localizedDescription)）。这次运行里仍按新的来，下次打开会回到旧值；请检查磁盘空间和权限。"
@@ -279,12 +283,13 @@ final class WorkerOutput: @unchecked Sendable {
     func chooseLibrary() {
         let panel = NSOpenPanel(); panel.title = L("选择游戏库位置：放导出时的工作数据和存档，游戏原件不用挪（首次请选择空文件夹）"); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = true; panel.prompt = L("选择")
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        // 游戏库（导出时的工作数据）要放 APFS；游戏原件放哪都行、原地只读（11-02 维护者定）。选到 exFAT 等不拦，说明后工作数据放内置盘的默认位置（后端 setup 同一规则兜底）
+        // 游戏库（导出时的工作数据）要放 APFS 或 exFAT；游戏原件放哪都行、原地只读。FAT32 等仍说明后改用默认位置（后端 setup 同一规则兜底）
         let format = Store.volumeFormat(url)
-        if !format.isEmpty, format != "apfs" { libraryFormatProblem = LibraryFormatProblem(path:url.path, format:format); return }
+        let ok = format.isEmpty || format == "apfs" || format == "exfat"
+        if !ok { libraryFormatProblem = LibraryFormatProblem(path:url.path, format:format); return }
         setupLibrary(url)
     }
-    /// 改用这台 Mac 上的默认位置（私有目录下的「游戏库」，在内置盘上）；用户指定过 S2Arm 数据目录时跟着它，不一定在内置盘
+    /// 改用这台 Mac 上的默认位置（~/S2Arm，在内置盘上）；用户指定过 S2Arm 数据目录时是数据目录下的「游戏库」，不一定在内置盘
     func useDefaultLibrary() {
         try? FileManager.default.createDirectory(at:defaultLibraryURL, withIntermediateDirectories:true)
         setupLibrary(defaultLibraryURL)
@@ -480,8 +485,11 @@ final class WorkerOutput: @unchecked Sendable {
         if parts.first == "Volumes", parts.count > 1, !FileManager.default.fileExists(atPath:"/Volumes/" + parts[1]) { return }
         preferences.library = ""; preferences.libraryId = ""; preferences.onboardingComplete = false; savePreferences()
     }
-    // 缺省游戏库（维护者 10-23：减少交互，首次打开不再让玩家选库）：应用私有目录下的「游戏库」，设置里可换
-    var defaultLibraryURL: URL { privateRoot.appendingPathComponent("游戏库") }
+    // 缺省游戏库（维护者 10-23：减少交互，首次打开不再让玩家选库）：~/S2Arm（游戏库结构 P3：访达里看得见；自定义数据目录时仍在数据目录里），设置里可换
+    var defaultLibraryURL: URL { S2ArmPaths.defaultLibrary(privateRoot:privateRoot) }
+    /// 任务日志 + 任务记录：固定 <私有目录>/logs（任务记录 logs/jobs/，剃刀 H6；S2ArmPaths.logsRoot，同作业层 core.logs_root）
+    var logsRoot: URL { S2ArmPaths.logsRoot(privateRoot:privateRoot) }
+    var jobsRoot: URL { logsRoot.appendingPathComponent("jobs") }
     func ensureLibrary(_ then: @escaping () -> Void) {
         guard preferences.library.isEmpty else { then(); return }
         worker("setup",extra:["library":defaultLibraryURL.path,"libraryId":""]) { result in
@@ -628,9 +636,9 @@ final class WorkerOutput: @unchecked Sendable {
             req["libraryId"] = ""
             req["storageLibraryId"] = preferences.libraryId
         }
-        let dir = privateRoot.appendingPathComponent("requests"); try? FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700]); let file = dir.appendingPathComponent(id+".json")
+        let dir = privateRoot.appendingPathComponent("requests"); try? FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true); let file = dir.appendingPathComponent(id+".json")
         do {
-            let data = try JSONSerialization.data(withJSONObject:req); try data.write(to:file,options:.atomic); try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:file.path)
+            let data = try JSONSerialization.data(withJSONObject:req); try data.write(to:file,options:.atomic)
             let python = try pythonExecutable()
             let isGUI = operation.hasPrefix("platform")
             let entry = try isGUI ? guiJobURL() : jobEngineURL()
@@ -652,7 +660,7 @@ final class WorkerOutput: @unchecked Sendable {
                     } else if let i = self.tasks.firstIndex(where:{$0.id == id}), self.tasks[i].active {
                         self.tasks[i].state = p.terminationStatus == 130 ? "cancelled" : "interrupted"; self.tasks[i].message = "工作进程已退出。可重试并验证完成阶段。"
                         if p.terminationStatus != 130 {
-                            let log=self.privateRoot.appendingPathComponent("logs/\(id)-bootstrap.log")
+                            let log=self.logsRoot.appendingPathComponent("\(id)-bootstrap.log")
                             try? FileManager.default.createDirectory(at:log.deletingLastPathComponent(),withIntermediateDirectories:true)
                             try? output.errorText.write(to:log,atomically:true,encoding:.utf8)
                             self.tasks[i].diagnostics=[self.nativeDiagnostic(code:"worker_interrupted",summary:"工作进程已退出。可重试并验证完成阶段。",detail:output.errorText,logPath:log.path)]
@@ -752,6 +760,7 @@ final class WorkerOutput: @unchecked Sendable {
                 if let path = result["ipa"] as? String { tasks[index].ipaPath = path }
                 if let device = result["device"] as? String { tasks[index].device = device }
                 if let files = result["packFiles"] as? Int { tasks[index].packFiles = files }
+                if let pending = result["unpackPending"] as? String { tasks[index].unpackPending = pending }
             }
             let state = e["state"] as? String
             if state == "completed" { let callback=callbacks.removeValue(forKey:id);callback?(e["result"] as? [String:Any] ?? [:]) }
@@ -766,6 +775,16 @@ final class WorkerOutput: @unchecked Sendable {
             }
         }
     }
+    /// enqueue 会不会被挡回、为什么（控制口 POST /build target=mac 先问它：原先挡回时静默 return，控制口照回 ok 却没建任务）；不挡 → nil
+    func enqueueBlocker(_ game: Game) -> String? {
+        // 同 importPrerequisitesReady 的三条，但不弹引导页（这里只是问）
+        if !environmentReady { return "环境缺东西：看 GET /state 的 checks，处理后 POST /environment 重查" }
+        if preferences.library.isEmpty { return "还没选游戏库：s2armctl library <目录>" }
+        if !hasImportedKeys || !FileManager.default.isReadableFile(atPath: privateRoot.appendingPathComponent("keys/prod.keys").path) { return "还没放密钥：s2armctl keys <prod.keys>" }
+        if !game.buildable { return "这款还不能编译：" + ((game.missing ?? []).isEmpty ? "兼容性不支持" : (game.missing ?? []).joined(separator: "、")) }
+        if queue.contains(game.id) || tasks.contains(where: { $0.operation == "build" && $0.gameId == game.id && $0.active && !$0.id.hasPrefix("queued-") }) { return "这款已在编译或排队，没有新建任务" }
+        return nil
+    }
     func enqueue(_ game: Game, auto: Bool = false) {
         guard importPrerequisitesReady() else { return }
         guard game.buildable else { showRequirements(game); return }
@@ -773,13 +792,13 @@ final class WorkerOutput: @unchecked Sendable {
         queue.append(game.id)
         if auto { autoQueue.insert(game.id) } else { autoQueue.remove(game.id) }
         let rec = TaskRecord(id:"queued-"+game.id,operation:"build",state:"queued",gameId:game.id,started:Date().timeIntervalSince1970)
-        if let d = try? JSONEncoder().encode(rec) {persist(d,to:privateRoot.appendingPathComponent("jobs/\(rec.id).json"),"出包队列")}
+        if let d = try? JSONEncoder().encode(rec) {persist(d,to:jobsRoot.appendingPathComponent("\(rec.id).json"),"出包队列")}
         selection = "tasks"; startNext()
     }
     func dequeue(_ id:String) {
         queue.removeAll {$0==id}; spaceOverrideGames.remove(id)
         tasks.removeAll {$0.id=="queued-"+id}
-        let path=privateRoot.appendingPathComponent("jobs/queued-\(id).json")
+        let path=jobsRoot.appendingPathComponent("queued-\(id).json")
         if let d=try? Data(contentsOf:path),var record=try? JSONDecoder().decode(TaskRecord.self,from:d){record.state="cancelled";record.message="已从队列移除";if let data=try? JSONEncoder().encode(record){persist(data,to:path,"出包队列")}}
     }
     func startNext() {
@@ -791,7 +810,7 @@ final class WorkerOutput: @unchecked Sendable {
             if executionBusy { return }
         }
         guard !queue.isEmpty else { return }
-        let id = queue.removeFirst(); tasks.removeAll {$0.id=="queued-"+id}; try? FileManager.default.removeItem(at:privateRoot.appendingPathComponent("jobs/queued-\(id).json")); executionTask = worker("build",extra:spaceOverrideGames.remove(id) != nil ? ["gameId":id,"spaceOverride":true] : ["gameId":id]) { _ in self.notice = "打包完成，可以启动了。" }
+        let id = queue.removeFirst(); tasks.removeAll {$0.id=="queued-"+id}; try? FileManager.default.removeItem(at:jobsRoot.appendingPathComponent("queued-\(id).json")); executionTask = worker("build",extra:spaceOverrideGames.remove(id) != nil ? ["gameId":id,"spaceOverride":true] : ["gameId":id]) { _ in self.notice = "打包完成，可以启动了。" }
         autoBuildTask = autoQueue.remove(id) != nil ? executionTask : nil
     }
     func launch(_ game: Game, inputGuideHandled: Bool = false) {
@@ -872,7 +891,7 @@ final class WorkerOutput: @unchecked Sendable {
     }
     func packMode(for task: TaskRecord) -> PackGraphicsMode { PackModeJudge.mode(packEvidence(for: task)) }
     func persistTask(_ task: TaskRecord) {
-        let folder=privateRoot.appendingPathComponent("jobs")
+        let folder=jobsRoot
         let path=folder.appendingPathComponent(task.id+".json")
         try? FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
         if let data=try? JSONEncoder().encode(task) {persist(data,to:path,"任务记录",privateFile:true)}
@@ -889,9 +908,9 @@ final class WorkerOutput: @unchecked Sendable {
         }
         return message
     }
-    /// 这条任务日志的末几行（<私有>/logs/<任务号>-*.log 里最新的那份；只读末尾 16 KB），任务页「实时日志」用：去掉行首时刻与空行、把私有目录换成 ~
+    /// 这条任务日志的末几行（logsRoot/<任务号>-*.log 里最新的那份；只读末尾 16 KB），任务页「实时日志」用：去掉行首时刻与空行、把私有目录换成 ~
     func logTail(for task: TaskRecord, lines n: Int) -> [String] {
-        let dir = privateRoot.appendingPathComponent("logs")
+        let dir = logsRoot
         guard let names = try? FileManager.default.contentsOfDirectory(atPath:dir.path) else { return [] }
         let mine = names.filter { $0.hasPrefix(task.id) && $0.hasSuffix(".log") }.map { dir.appendingPathComponent($0) }
         guard let url = mine.max(by:{ ((try? $0.resourceValues(forKeys:[.contentModificationDateKey]).contentModificationDate) ?? .distantPast) < ((try? $1.resourceValues(forKeys:[.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }),
@@ -907,10 +926,10 @@ final class WorkerOutput: @unchecked Sendable {
     func diagnosticLogURL(_ diagnostic: TaskDiagnostic?) -> URL {
         if let path=diagnostic?.logPath {
             let url=URL(fileURLWithPath:path).resolvingSymlinksInPath()
-            let roots=[privateRoot.appendingPathComponent("logs"),libraryURL.appendingPathComponent("cache")]
+            let roots=[logsRoot,libraryURL.appendingPathComponent("cache")]
             if url.pathExtension == "log",roots.contains(where:{url.path.hasPrefix($0.resolvingSymlinksInPath().path+"/")}) {return url}
         }
-        return privateRoot.appendingPathComponent("logs")
+        return logsRoot
     }
     func copyDiagnostic(_ diagnostic: TaskDiagnostic? = nil) {
         let text=(diagnostic ?? errorDiagnostic)?.reportText ?? L(error ?? "")
@@ -951,15 +970,17 @@ final class WorkerOutput: @unchecked Sendable {
     // 装到 iPhone（10-26 维护者 定：Xcode 做主路、AltStore 备选）：用玩家在 Xcode 登录的 Apple ID 重签自签 IPA、数据线装上、拷资源包并逐文件核对（pack/jobs/install.py）
     func installToPhone(_ game: Game) {
         selection = "tasks"
-        executionTask = worker("install",extra:["gameId":game.id]) { r in
+        executionTask = worker("install",extra:["gameId":game.id].merging(downstreamScheme(game).map { ["scheme":$0] } ?? [:]) { a, _ in a }) { r in
             let device = (r["device"] as? String).map { "「\($0)」" } ?? ""   // 设备名夹在句中：按片段先翻译再拼（提示显示时 L() 整句查不到）
-            let done = L("已装到 iPhone") + device + Store.packPushedClause(r["packFiles"] as? Int) + L("。打开游戏：第一次会先导入游戏资源（几分钟），保持在前台、别锁屏，导入完会自动进入游戏。免费 Apple ID 签的 App 7 天过期，到时连上再点一次「装到 iPhone」。")
+            // 资源传完但没拉起 App 解开（作业结果 unpackPending，11-09 #336）：不说「已装到 iPhone」，说还差的一步和原因 / 办法（后端原话）
+            let done = (r["unpackPending"] as? String) ?? L("已装到 iPhone") + device + Store.packPushedClause(r["packFiles"] as? Int) + L("。打开游戏：第一次会先导入游戏资源（几分钟），保持在前台、别锁屏，导入完会自动进入游戏。免费 Apple ID 签的 App 7 天过期，到时连上再点一次「装到 iPhone」。")
             self.stickyNotice = done; self.notice = done
         }
     }
     /// 出 iPhone 包的请求：目标设备可有可无（有才带 target）
     func ipaRequest(_ game: Game, target: IPhoneTarget?, spaceOverride: Bool = false) -> [String:Any] {
         var r: [String:Any] = ["gameId":game.id]
+        if let s = downstreamScheme(game) { r["scheme"] = s }   // 玩家在确认页选了下游深度方案
         if spaceOverride { r["spaceOverride"] = true }   // 空间预检拦下后玩家点了「仍然继续」
         if let t = target { r["target"] = t.request }
         return r

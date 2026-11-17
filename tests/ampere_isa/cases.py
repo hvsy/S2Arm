@@ -99,6 +99,24 @@ for left in (True, False):
                          inp, body, want, '64位整数字段独立期望；零值缺陷/非零正控；默认32位clamp端点另待规格裁决')
 
 
+# ---- #798 Maxwell FMUL / FFMA .FMZ（InstEmitFloatArithmetic EmitFmz，不走 Ampere AFmz）：积里有一个因子是 0，积就是 0（D3D9 规则，Inf / NaN × 0 = 0）----
+#   编码按 Ryujinx 解码器（InstDecoders.cs InstFmulR / InstFfmaR）：FMUL R = 0101110001101…（0x5c68 << 48），Rd 0..8、Ra 8..16、Rb 20..28、守卫 16..19 = PT、
+#   .FMZ = 44..46 取 2、乘数缩放 41..44 = 0（不缩放）；FFMA R = 010110011…（0x5980 << 48），Rc 39..47、.FMZ = 53..55 取 2。期望按规则手算，不跑翻译器
+def maxwell_load(rd, word): return 0x4c40000000000000 | 7 << 48 | 3 << 41 | 3 << 34 | word << 20 | 7 << 16 | 255 << 8 | rd   # LOP.PASS_B Rd, RZ, c[3][4·word]（同上 SHF 例）
+def maxwell_fmul_fmz(rd, ra, rb): return 0x5c68000000000000 | 2 << 44 | rb << 20 | 7 << 16 | ra << 8 | rd
+def maxwell_ffma_fmz(rd, ra, rb, rc): return 0x5980000000000000 | 2 << 53 | rc << 39 | rb << 20 | 7 << 16 | ra << 8 | rd
+INF, NAN = float('inf'), float('nan')
+fm = [(0.0, INF), (INF, 0.0), (NAN, 0.0), (2.0, 3.0)]   # 车道 3 是非零正控
+case('Maxwell FMUL.FMZ（0 × Inf / Inf × 0 / NaN × 0 = 0）', True, [f32(v) for a in fm for v in a],
+     maxwell_shader([maxwell_load(4 + 2 * i, 2 * i) for i in range(4)] + [maxwell_load(5 + 2 * i, 2 * i + 1) for i in range(4)]
+                    + [maxwell_fmul_fmz(i, 4 + 2 * i, 5 + 2 * i) for i in range(4)]),
+     [0, 0, 0, f32(6.0)], 'D3D9 乘零规则（FMZ）：因子有一个是 0 → 积为 +0；车道 3 = 2 × 3')
+ff = [(0.0, INF, 5.0), (INF, 0.0, -1.0), (NAN, 0.0, 2.0), (2.0, 3.0, 1.0)]
+case('Maxwell FFMA.FMZ（0 × Inf + c = c）', True, [f32(v) for a in ff for v in a],
+     maxwell_shader([maxwell_load(4 + 3 * i + k, 3 * i + k) for i in range(4) for k in range(3)]
+                    + [maxwell_ffma_fmz(i, 4 + 3 * i, 5 + 3 * i, 6 + 3 * i) for i in range(4)]),
+     [f32(5.0), f32(-1.0), f32(2.0), f32(7.0)], 'FMZ：积为 0 → 结果 = 加数 c；车道 3 = 2 × 3 + 1')
+
 # ---- BMSK / UBMSK（0x01b / 0x09b；位置 A、宽度第二源、.W = 75）：PTX bmsk —— .wrap 两者取模 32，.clamp 两者封顶 32；宽 0 → 0；超出 31 位的截掉 ----
 def bmsk(pos, width, wrap):
     if wrap: pos &= 31; width &= 31
@@ -111,6 +129,12 @@ for wrap in (1, 0):
     case(f'BMSK{".W" if wrap else ""} 寄存器形式', True, [v for p in ins for v in p], body, [bmsk(p, w, wrap) for p, w in ins], 'PTX bmsk.wrap / .clamp')
 case('BMSK.W 立即数宽度（形式 4：宽度在 32..64）', True, [12], [MOVC(4, 0), alu(0x01b, 4, 0, 4, w=(75, 1), imm=(32, 4)), MOVI(1, 0), MOVI(2, 0), MOVI(3, 0)],
      [bmsk(12, 4, 1), 0, 0, 0], 'PTX bmsk.wrap')
+# ---- S2UR URd, SR 0x84（0x9c3，SR 号 72..80）：Switch 2 片元着色器读它、UPRMT 取第 1 / 2 字节（0x7771 / 0x7772）后当除数（04008E001F098000 有 611 支）----
+#   看作粗粒度着色（可变着色率）的片元宽 / 高：宿主按全速率着色 = 1 × 1。原先 SReg 表没有 0x84、走 default 给 0，着色器算出 1 / 0（海面 Inf / NaN，自动曝光被拖垮）
+UPRMT = lambda urd, ura, sel: alu(0x096, 4, urd, ura, imm=(32, sel), rc=(64, URZ))   # UPRMT URd, URa, imm32, URc（形式 4，同反汇编 0x896：选择子在 32..64，第三源 URc 在 64..70）
+case('S2UR SR 0x84（片元粗着色尺寸：第 1 / 2 字节 = 1 × 1）', True, [],
+     [inst(0x9c3, urd=(16, 4), sr=(72, 0x84)), UPRMT(5, 4, 0x7771), UPRMT(6, 4, 0x7772), MOVU(0, 4), MOVU(1, 5), MOVU(2, 6), MOVI(3, 0)],
+     [0x00010100, 1, 1, 0], '宿主全速率着色：宽 = 高 = 1（游戏的 611 支只取这两个字节；其余字节没有读者，按 0）')
 case('UBMSK（统一数据通路，UR 6 位寄存器号）', True, [3, 7], [ULDC(4, 0), ULDC(5, 1), alu(0x09b, 1, 6, 4, w=(75, 1), **R(5)), MOVU(0, 6), MOVI(1, 0), MOVI(2, 0), MOVI(3, 0)],
      [bmsk(3, 7, 1), 0, 0, 0], 'PTX bmsk.wrap')
 
@@ -294,8 +318,10 @@ for x0, dx, y0 in [(2, 3, 9), (11, 2, 4)]:
 #   u · 16 − 0.5 = x0 + 0.5 → i0 = x0、j0 = y0（最近点、边缘夹取，偏移后都在界内）
 TLD4P = lambda rd, ra, rb, comp: inst(0xb63, rd=(16, rd), ra=(24, ra), rb=(32, rb), h=(40, 0x28), bank=(54, 2), dim=(61, 1), mask=(72, 0xf), rc=(64, RZ), res=(81, PT), off=(76, 2), comp=(87, comp))
 def pack_off(a, b): return (a[0] & 63) | (a[1] & 63) << 8 | (b[0] & 63) << 16 | (b[1] & 63) << 24
-for x0, y0, offs in [(6, 7, [(-1, 2), (3, 0), (0, -2), (2, 1)]), (4, 10, [(0, 0), (1, 0), (0, 1), (-3, -4)])]:
-    case(f'TLD4.PTP 四个立即数偏移（{x0}, {y0}）{offs}', True, [f32((x0 + 1) / TW), f32((y0 + 1) / TW)],
+# 后两组是 2x2 方块（乱序、负角）：Dsh.cs GatherQuad 改成一次 gather + 换序（照 nxnative 0c8a3ac0），期望同四次 gather 的规格值；改前（四次 gather）也该对，不标新
+for x0, y0, offs in [(6, 7, [(-1, 2), (3, 0), (0, -2), (2, 1)]), (4, 10, [(0, 0), (1, 0), (0, 1), (-3, -4)]),
+                     (5, 8, [(1, 1), (0, 0), (1, 0), (0, 1)]), (9, 6, [(-2, 0), (-1, -1), (-2, -1), (-1, 0)])]:
+    case(f'TLD4.PTP 四个立即数偏移（{x0}, {y0}）{offs}', x0 in (6, 4), [f32((x0 + 1) / TW), f32((y0 + 1) / TW)],
          [MOVC(4, 0), MOVC(5, 1), MOVI(8, pack_off(offs[0], offs[1])), MOVI(9, pack_off(offs[2], offs[3])), TLD4P(0, 4, 8, 1)],
          [f32(float(texel(x0 + ox, y0 + oy)[1])) for ox, oy in offs], '纹素 (x0 + ox, y0 + oy).y = (y0 + oy)·16 + x0 + ox + 1，按偏移次序', ('tex2d', TW))
 
@@ -399,6 +425,15 @@ refl('TLD4.PTP 立即数偏移：四次常量偏移 gather（时之笛 NDSR b106
      [MOVC(4, 0), MOVC(5, 1), MOVI(8, pack_off((-1, 2), (3, 0))), MOVI(9, pack_off((0, -2), (2, 1))), TLD4P(0, 4, 8, 1)], gather_const,
      'SPIR-V ConstOffsets 第 k 个分量取偏移 k 处的纹素；Metal gather 偏移只认常量表达式')
 
+# 四个偏移是 2x2 方块（11-13，照 nxnative 0c8a3ac0）：一次 gather 在方块角 b、按 Metal 次序 x (i0, j1)、y (i1, j1)、z (i1, j0)、w (i0, j0) 换成偏移次序，不再有 s2a_gather4
+def gather_quad(msl, j):
+    if 's2a_gather4(' in msl: return 'MSL 仍是四次 gather（s2a_gather4）'
+    got = re.findall(r'\.gather\([^;]*?, (int2\([^()]*\)), component::y\)\.(\w+)\)', msl)
+    return None if got == [('int2(-2, -1)', 'xywz')] else f'方块 gather {got}，应为一次 int2(-2, -1) 处 gather、换序 xywz'
+refl('TLD4.PTP 偏移是 2x2 方块：一次 gather + 换序（nxnative 0c8a3ac0）', True,
+     [MOVC(4, 0), MOVC(5, 1), MOVI(8, pack_off((-2, 0), (-1, 0))), MOVI(9, pack_off((-2, -1), (-1, -1))), TLD4P(0, 4, 8, 1)], gather_quad,
+     '整数偏移下每个偏移取的 (i0, j0) 角正好是方块角足迹的四个纹素')
+
 # SURED 的操作取 87..91（9507c221c）：原先只认 ADD。SURED [R4], R6（0x59f）：坐标 R4、R5，值 R6，句柄 c[2] 0x120（图像槽 0，字偏移 0x48 在 40..54、库 2 在 54..59），
 # 维度 61..64 = 3（SuDim 二维），字 2 = 0x0010e000 | 操作 << 23（MAX 2、OR 6，RedOp 同 SUATOM 的次序）
 SURED = lambda op: inst(0x59f, ra=(24, 4), rb=(32, 6), h=(40, 0x48), bank=(54, 2), dim=(61, 3), w2=(64, 0x0010e000 | op << 23))
@@ -472,6 +507,23 @@ refl('ISBERD.b8 读回任务自己写的载荷字（时之笛 5d3a096025e375a1�
      lambda msl, j: (lambda m: None if m and re.search(r'= (?:as_type<\w+>\()?%s\[%s\]' % (m.group(1), m.group(2)), msl) and re.search(r'%s\[%d\] = ' % (m.group(1), int(m.group(2)) + 1), msl)
                      else '读回的不是刚写的那个阶段内存字（或没写到 +0x14）')(re.search(r'(\w+)\[(\d+)\] = 4660u;', msl)),
      '写 [+0x10] = 0x1234、读回同一个字、再写 [+0x14]（下一个字）；修前「ISBERD mode b8 in a task or mesh shader」拒翻')
+
+# 投票的位掩码留在原处（04008E001F098000 近海任务着色器 8acb4308：最低活动车道之外都 return 之后才写 popcount(ballot)）：任务着色器 32 线程，
+#   S2R R0 = 车道号，P1 = 车道号 != 0，VOTE.ANY R5 ← ballot(P1)（31 个车道置位），全体车道先写 POPC(R5) 到载荷 +0x10，@P1 EXIT，剩下的车道 0 再写 POPC(R5) 到 +0x14。
+#   期望（手推）：位掩码在 return 之前就取（硬件上 VOTE 执行时 32 车道都在：两处 POPC 都是 31）。修前 AST 优化把位掩码（一元运算、源是变量，用两次也挪）
+#   复制到每个使用处，第二处落在其他车道 return 之后，只剩车道 0 自己（它的 P1 假，POPC = 0；近海每组 32 块只画 1 块）。
+#   用任务着色器：计算着色器这条单测链不做表达式传播，测不出来；谓词要是车道变量：常量 ballot(true) 修前也不挪
+VOTE_ANY = lambda rd, p: inst(0x806, rd=(16, rd), mode=(72, 1), pd=(81, PT), p=(87, p))
+POPC = lambda rd, rb: alu(0x109, 1, rd, RZ, rb=(32, rb))
+def at_p1(v): return v & ~(0xf << 12) | 1 << 12   # 守卫 @P1
+def ballot_before_return(msl, j):
+    body = msl[msl.find('dm_stage_body'):] if 'dm_stage_body' in msl else msl
+    r = body.find('return;'); bs = [m.start() for m in re.finditer(r'spvSubgroupBallot\(', body)]
+    if not bs: return 'MSL 里没有 spvSubgroupBallot'
+    return None if r < 0 or max(bs) < r else '位掩码在其他车道 return 之后才取'
+refl('投票位掩码不挪过提前返回（近海 8acb4308）', True,
+     ts_shader([S2R(0, 0x00), ISETP_NE(1, 0, RZ), VOTE_ANY(5, 1), POPC(7, 5), STO(0x10, 7), at_p1(EXIT), POPC(6, 5), STO(0x14, 6)]),
+     ballot_before_return, 'VOTE 在全体车道都在时取位掩码，车道 0 之后才 POPC：位掩码不能等到 POPC 处才算')
 
 # 多处池表读（11-05 时之笛慢编；11-07 时之笛主遍顶点）：地址从内存里读出来的全局读，翻译器追不到具体存储缓冲，走查内存池表。11-05 把整个查表函数改成不内联（每处一份展开时
 # 3d0d6d61bb9076e7 253 处、IR 6.5 万条），可函数带线程私有字（上次命中项）的引用，调用点按调用约定存栈取栈：时之笛主遍顶点着色器每顶点 253 次调用、主遍六成时间。
@@ -639,18 +691,25 @@ def main():
         err = f'翻不过 {v[1:] if isinstance(v, list) else r}' if not isinstance(v, list) or v[0] == 'fail' else check(v[0], v[1])
         bad += err is not None
         print(f'{"✓" if err is None else "✗"} {name}：{"符合" if err is None else err}（{why}）')
+    # 全部 GPU 用例交给一个 frag_run 进程（--batch，一行一例）：每个用 Metal 的进程退出都会永久漏掉 1 个 IOSurface 名额（macOS 26.4.1 驱动），原先每例一个进程
     with tempfile.TemporaryDirectory() as t:
-        for (name, new, inputs, body, want, why, tex), r in zip(CASES, res):
+        lines, todo = [], []
+        for i, ((name, new, inputs, body, want, why, tex), r) in enumerate(zip(CASES, res)):
             v = r.get('ok')
             if not isinstance(v, list) or v[0] == 'fail':
                 bad += 1; print(f'✗ {name}：翻不过 {v[1:] if isinstance(v, list) else r}'); continue
-            mp = os.path.join(t, 'f.metal'); open(mp, 'w').write(v[0])
+            mp = os.path.join(t, f'f{i}.metal'); open(mp, 'w').write(v[0])
             pool = tex and tex[0] == 'pool'
-            texarg = ['-P', f'{tex[1]}:{tex[2]:x}:{tex[3]}' + ''.join(f':{x}' for x in tex[4:])] if pool else ['-T', f'{os.environ.get("TBUF_FORM", tex[0]) if tex[0] not in ("tex1d", "tex2d") else tex[0]}:{tex[1]}'] if tex else []   # TBUF_FORM=fixed：负对照，宿主按固定 16384 列的行绑
-            p = subprocess.run([run, mp, *arg_spec(v[0], v[1] if pool else None), *texarg, *[f'{w:08x}' for w in inputs]], capture_output=True, text=True, timeout=60)
-            got = [int(w, 16) for w in p.stdout.split()] if p.returncode == 0 else None
+            texarg = ['-P', f'{tex[1]}:{tex[2]:x}:{tex[3]}' + ''.join(f':{x}' for x in tex[4:])] if pool else ['-T', f'{os.environ.get("TBUF_FORM", tex[0]) if tex[0] not in ("tex1d", "tex2d") else tex[0]}:{tex[1]}'] if tex else []   # TBUF_FORM=fixed：负对照
+            lines.append('\t'.join([mp, *arg_spec(v[0], v[1] if pool else None), *texarg, *[f'{w:08x}' for w in inputs]])); todo.append((name, want, why))
+        p = subprocess.run([run, '--batch'], input='\n'.join(lines) + '\n', capture_output=True, text=True, timeout=60 + 5 * len(lines))
+        outs = p.stdout.splitlines()
+        if len(outs) != len(todo): bad += 1; print(f'✗ frag_run 批量只回了 {len(outs)} / {len(todo)} 行（退出 {p.returncode}）：{p.stderr.strip()[:300]}')
+        for (name, want, why), o in zip(todo, outs):
+            f = o.split('\t')
+            got = [int(w, 16) for w in f[1].split()] if f[0] == 'ok' else None
             ok = got == want; bad += not ok
-            print(f'{"✓" if ok else "✗"} {name}：期望 {" ".join(f"{w:08x}" for w in want)} → 真结果 {" ".join(f"{w:08x}" for w in got) if got else p.stderr.strip()[:200]}（{why}）')
+            print(f'{"✓" if ok else "✗"} {name}：期望 {" ".join(f"{w:08x}" for w in want)} → 真结果 {" ".join(f"{w:08x}" for w in got) if got else f[-1][:200]}（{why}）')
     n = len(CASES) + len(REFL)
     print(f'Ampere 指令单测：{n - bad}/{n} 例过（GPU 读回 {len(CASES)} 例 + 只看翻译结果 {len(REFL)} 例；标「新」的 {sum(c[1] for c in CASES) + sum(c[1] for c in REFL)} 例）')
     return 1 if bad or ir_bad else 0

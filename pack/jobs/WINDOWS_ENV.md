@@ -25,7 +25,7 @@ Python 接口：`check(request, *, probe=None)`。默认 `NativeProbe` 获取真
 | `targetDir` | 计划输出目录；有catalog时省略用其父目录（游戏库目录），否则用当前目录；未存在时只查最近存在祖先的卷，不建目录 |
 | `requiredFreeBytes` | 显式出包计划预算，非负整数字节数；优先于catalog计算，存在时不读取catalog |
 | `catalog` / `gameId` | 可选游戏库catalog.json路径与游戏id；两者齐全且无显式预算时，沿用library.py的selected_packages和共用预算纯函数；缺配对字段/未知游戏不判绿。三者（含 `requiredFreeBytes`）都没给 = 还没选游戏：不列 `disk` 项、不拖 `ready`，选好游戏开始前带上再查 |
-| `metal` | 显式Metal路径；省略用S2A_METAL_EXE、PATH metal.exe，再用官方安装器缺省目录（S2A_METAL_BIN，同 oneclick_win.metal_bin）；普通非链接文件才执行有界--version |
+| `metal` | 显式Metal路径；省略用S2A_METAL_EXE，再沿用出包目录选择：S2A_METAL_BIN → PATH metal.exe → 官方默认目录；普通非链接文件才执行有界--version |
 | `shell` / `target` | 预编壳目录、出包目标（`ios` 缺省 / `mac`）；交给出包件自检（见下） |
 | `anisette` | 可选对象：`source` 为 `local`、`self-hosted` 或 `public`；远程配置提供 `endpoint`，公共备选须显式 `allowPublic: true` |
 | `offline` | 可选布尔值，声明离线场景；两种模式均只读本机，不发健康检查或登录请求，不省略检查项 |
@@ -43,7 +43,10 @@ Python 接口：`check(request, *, probe=None)`。默认 `NativeProbe` 获取真
   `pack/orch/oneclick_win.py` 的 `env_items`（即 `oneclick_win --check` 那一份），不另写规则；其中 python、metal 两行由本模块核得更细，不重复列。
 - 签名装机 `impactor`：玩家自装的官方 Impactor 实测版本 + 同版本命令行 plumesign（`pack/jobs/impactor.py`、`pack/orch/install_win.py`）。
 - 作废（随包运行时 + 预编件之后）：`dotnet_sdk`（玩家只要随包的 .NET 运行时）、`rewriter` / `sidecar` 的「待发布」项。
-当前各项均属于 `prepare/ipa` 必需项。状态为 `ok/missing/mismatch/unverified/error/user-selected`；
+
+Metal 的默认目录选择与 `oneclick_win --check` 共用 `oneclick_win.metal_exe()`（逐处列表 `metal_search()`）：`S2A_METAL_BIN` 优先；未配置时依次找启动器启动时的 PATH、注册表里现在的 PATH（启动器开着时才装的）、官方安装器卸载登记的安装目录（安装器不写 PATH，改过安装目录只有这里记着）、`%ProgramW6432%` / `%ProgramFiles%` / `C:\Program Files` 下的 `Metal Developer Tools`；每个安装目录认 `bin\metal.exe` 与早期版本的 `ios\bin\metal.exe`。都没找到时，环境检查的 metal 一项 message 带「找过：来源：路径 → 有 / 没有」，玩家「复制错误摘要」即带上。显式目录无效时照实报缺，不偷偷换成 PATH 上另一份。出直连库时把选中目录作为 `S2A_METAL_BIN` 传给子进程，Python / C# 的 `metal.exe` 与 `metallib.exe` 都从同一目录取；不会从 PATH 混用另一份链接器。相对 PATH 条目会先转成绝对路径。请求 `metal` 与 `S2A_METAL_EXE` 仍只覆盖本次只读版本探测；要配置实际出包目录用 `S2A_METAL_BIN`。
+
+只有 Impactor、anisette、Apple 设备服务和 USB 设备属于签名装机（`requiredFor` 为 `install`），不挡导入和出包。其余各项属于 `prepare/ipa`，`blocking` 为真（确实缺或确实不符）才挡；认不出、探测失败只提示。状态为 `ok/missing/mismatch/unverified/error/user-selected`；
 只有所有必需项 `ok` 才能 `ready=true`。一个探测失败仍列出其余项；解释器失败时逐项列依赖未核实。
 摘要和 JSON 使用相同状态，异常不回显命令原始输出、私有路径或配置内容。
 
@@ -83,7 +86,7 @@ RECOVERY只增加10个Windows码，已有tool_missing/device_not_connected/disk_
 共享`launchers/shared/experience.v1.json`同步中英title/detail和来源指针，revision6→7；
 next_action只指pack/jobs/errors.py，不复制恢复动作，不改Swift或出包/翻译键。
 安装入口经官方资料核对：[.NET SDK](https://learn.microsoft.com/en-us/dotnet/core/install/windows)、
-[Windows Metal开发者工具](https://developer.apple.com/metal/tools/)、
+[Windows Metal开发者工具](https://developer.apple.com/download/all/?q=metal%20developer%20tools%20for%20windows)（Apple 下载区，要用 Apple 账号登录，免费的就行）、
 [Apple Devices与iTunes](https://support.apple.com/118290)、[iCloud for Windows](https://support.apple.com/103232)。
 
 本片新增19方法，原85方法及判绿函数/NativeProbe的AST保持不变。首17方法修前35断言FAIL、0errors/skip；
@@ -107,7 +110,7 @@ USB映射错码、用安装指引覆盖help。首轮help负控在Metal项被原�
 | Python 最低版本 | 从 `toolchain.py:preflight` 的现有 Python 比较定义读取；定义不再可识别即报错，不退到自造版本 |
 | Python 依赖 | 现有 `launchers/macos/requirements-runtime.txt` 精确钉版；该文件名虽带 macos，本入口只复用其清单，不运行 Mac 工作流 |
 | .NET SDK | `compat/tree/global.json` 和 `ipa.py:_sdk_ok`；运行 `dotnet --list-sdks`，运行时不能替代 SDK |
-| Metal | 请求metal路径（显式配置）→S2A_METAL_EXE→PATH metal.exe；版本命令与唯一metal_iphoneos测试锁提示 |
+| Metal | 请求metal路径 → S2A_METAL_EXE → 共用出包目录选择（S2A_METAL_BIN → PATH → 官方默认目录）；版本命令与唯一metal_iphoneos测试锁提示 |
 | Apple 支持 | SCM运行+本机27015连接即断，只证明驱动就绪；单独ListDevices确认USB数量 |
 | anisette | 当前用户Store安装元数据身份与来源；显选公共备选只标user-selected，仍挡ready |
 | 空间 | `shutil.disk_usage` 实际可用字节，与显式预算或library.py共用出包计划预算比较；不另写公式 |
@@ -170,10 +173,9 @@ Apple驱动项与`apple_usb`设备项分开。驱动探测只连接`127.0.0.1:27
 协议事实参照[libusbmuxd ListDevices实现](https://github.com/libimobiledevice/libusbmuxd/blob/master/src/libusbmuxd.c)
 和[帧头定义](https://github.com/libimobiledevice/usbmuxd/blob/master/src/usbmuxd-proto.h)，本片使用标准库独立实现，不安装该库。
 
-官方iCloud当前支持的正证据：当前用户注册的`.iCloud`包、Apple Inc.证书主体CN/O、Store签名类别、
-Ok状态、相符包家族和有效版本元数据同时齐全。仅名称匹配或Developer/损坏包不判绿，输出只来源/版本，
-不输出发布者DN、包家族、路径或用户资料。Microsoft Store的[iCloud条目](https://apps.microsoft.com/detail/9pktq5699m62)
-发布者为Apple Inc.；[Get-AppxPackage](https://learn.microsoft.com/en-us/powershell/module/appx/get-appxpackage)
+官方iCloud当前支持的正证据：当前用户注册的包家族正好是`AppleInc.iCloud_nzyj5cx40ttqa`（末段由发布者算出，实机发布者是商店分配的编号，不是Apple Inc.）、Store签名类别、
+Ok状态和有效版本元数据同时齐全。仅名称匹配或Developer/损坏包不判绿，输出只来源/版本，
+不输出发布者DN、包家族、路径或用户资料。[Get-AppxPackage](https://learn.microsoft.com/en-us/powershell/module/appx/get-appxpackage)
 默认只查询当前用户。未读账号、iCloud数据/密码或安装包内容。
 HKLM64/32和HKCU卸载记录：DisplayName为iCloud且Publisher为Apple Inc.算官方传统安装版，判ok（11-08 实机：官方安装器装的7.21不走商店）；
 其余记录且无齐全Store证据报unverified。当前未检出只代表这些查询范围，不宣称所有用户或任意路径不存在。

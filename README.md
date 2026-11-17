@@ -1,10 +1,13 @@
-<p align="center"><img src="docs/images/s2arm-wordmark.png" width="420" alt="S2Arm"></p>
+<p align="center"><a href="https://s2arm.com"><img src="docs/images/s2arm-wordmark.png" width="420" alt="S2Arm"></a><br><a href="https://s2arm.com">s2arm.com</a></p>
+
+> [!NOTE]
+> **Good news: [s2arm.com](https://s2arm.com) is now the official S2Arm website.** S2Arm is free and open source and never accepts donations; get S2Arm only from [s2arm.com](https://s2arm.com) or this GitHub repository.
 
 **Your own Switch games, running natively on iPhone, iPad and Mac.** Game code is rewritten to native ARM64 and runs directly on the device's processor, with graphics going straight to Metal. Your whole library lives in one app, and a few clicks in the Mac or Windows launcher take a game from import to play.
 
 Platforms: iPhone / iPad (iOS / iPadOS 18 and later) · Mac (Apple silicon, macOS 15 and later) · Build on Mac or Windows · Android / HarmonyOS coming soon · License: Apache-2.0 · **Bring your own games**
 
-[简体中文](README.zh-CN.md) · [Download the launcher](https://github.com/jhaizhou-ops/S2Arm/releases) · [Evidence](docs/validation/EVIDENCE.md)
+[简体中文](README.zh-CN.md) · [Download the launcher](https://jhaizhou-ops.github.io/S2Arm/) · [All releases](https://github.com/jhaizhou-ops/S2Arm/releases) · [Evidence](docs/validation/EVIDENCE.md)
 
 <p align="center"><img src="docs/images/launcher-welcome-en.png" width="760" alt="S2Arm launcher welcome page"></p>
 
@@ -50,7 +53,11 @@ It moves forward with a few commands, and you can watch every step in the launch
 /Applications/S2Arm.app/Contents/Resources/s2armctl diag export ~/Desktop/S2Arm-diagnostics.zip   # export a diagnostic bundle if it cannot fix a problem
 ```
 
-Anything only you can do (system permission prompts, signing in with your Apple ID, tapping Trust on your phone), the AI stops and asks you to do. On Windows, use `s2armctl.cmd` in the launcher folder with the same commands; exporting a diagnostic bundle is currently Mac-only.
+Anything only you can do (system permission prompts, signing in with your Apple ID, tapping Trust on your phone), the AI stops and asks you to do. On Windows, use `s2armctl.cmd` in the launcher folder with the same commands. Windows builds iPhone / iPad packages only, so for problems inside a game export the diagnostic bundle on the phone: long-press the game screen with four fingers for 1.5 seconds and choose Export diagnostics.
+
+**Something wrong inside a game** (graphics, frame rate, stutter, crashes)? Send your AI:
+
+> Please read https://github.com/jhaizhou-ops/S2Arm/blob/main/skills/player-game-triage/SKILL.md . My S2Arm game has this problem: <describe it>. Check the settings first, then collect diagnostics; if you can change code, fix it at the root and open a PR, otherwise help me file an issue.
 
 ## Tested at scale
 
@@ -62,11 +69,11 @@ On a 16 GB MacBook Air (M3), from importing a game to a finished iPhone build, c
 
 | Game | Game files | Shaders | Build time |
 |---|---|---|---|
-| Diablo III | 23.5 GB | 1,222 | **6.4 min** |
-| Animal Crossing: New Horizons | 12.0 GB | 9,315 | **8.6 min** |
-| The Legend of Zelda: Tears of the Kingdom | 17.5 GB | 26,999 | **34 min** |
+| A 23.5 GB action RPG | 23.5 GB | 1,222 | **6.4 min** |
+| A 12.0 GB life-sim game | 12.0 GB | 9,315 | **8.6 min** |
+| A 17.5 GB open-world game | 17.5 GB | 26,999 | **34 min** |
 
-The Nintendo Switch 2 edition of *The Legend of Zelda: Ocarina of Time*, measured on an iPhone 17 Pro Max: a **full 60 fps** while the phone is cool, **37–43 fps** once sustained load has heated it up, at about **0.15 J per frame**. [Evidence](docs/validation/EVIDENCE.md#speed-and-efficiency)
+A Switch 2 game, measured on an iPhone 17 Pro Max: a **full 60 fps** while the phone is cool, **37–43 fps** once sustained load has heated it up, at about **0.15 J per frame**. [Evidence](docs/validation/EVIDENCE.md#speed-and-efficiency)
 
 ## Platforms
 
@@ -79,9 +86,17 @@ The Nintendo Switch 2 edition of *The Legend of Zelda: Ocarina of Time*, measure
 
 [Evidence](docs/validation/EVIDENCE.md#platforms)
 
+## Downstream deep ports
+
+Some games have a deep port made specially by the community. S2Arm recognizes these games: on export it shows a page explaining the option, and you can switch to the downstream project's route (importing, packing and installing are still buttons in S2Arm, with the downstream project's implementation underneath) or keep the standard route. The registry is [`pack/downstream/schemes.json`](pack/downstream/schemes.json); the contract between the two is the downstream project's document.
+
+| Route | Project | Devices | Contract |
+|---|---|---|---|
+| D2R-Mobile | [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) | iPhone / iPad (iOS 26 and later; Android and HarmonyOS in progress) | [docs/S2ARM.md](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/docs/S2ARM.md) |
+
 ## Getting started
 
-1. Download the Mac or Windows launcher from [Releases](https://github.com/jhaizhou-ops/S2Arm/releases) and open it. Building for iPhone on a Mac needs the free Xcode from the App Store, signed in with your Apple ID; the launcher walks you through it.
+1. Download the Mac or Windows launcher from the [download page](https://jhaizhou-ops.github.io/S2Arm/) and open it. Building for iPhone on a Mac needs the free Xcode from the App Store, signed in with your Apple ID; the launcher walks you through it.
 2. Import your own keys and games. Put the base game, updates and DLC in one folder and import them together.
 3. Choose iPhone / iPad or this Mac, then click Build.
 4. Follow the launcher to sign and install with your own Apple ID (the Windows launcher ships with the Impactor signing tool), open S2Arm, and pick a game from the library.
@@ -90,7 +105,7 @@ Back up your saves before updating the app. The release uses the new app identif
 
 ## Honest boundaries
 
-S2Arm runs 64-bit (AArch64) games. Apple silicon cannot execute 32-bit ARM code, so 32-bit games are outside what S2Arm supports. Confirmed so far: Ni no Kuni: Wrath of the White Witch, Goat Simulator, New Super Mario Bros. U Deluxe and Monster Hunter XX. Minecraft: Story Mode, which needs a 36-bit address space, is outside it as well. The full list with versions is on the [evidence page](docs/validation/EVIDENCE.md#unsupported-games).
+S2Arm runs 64-bit (AArch64) games. Apple silicon cannot execute 32-bit ARM code, so 32-bit games are outside what S2Arm supports, as are games that need a 36-bit address space.
 
 ## Development
 
@@ -100,16 +115,21 @@ S2Arm runs 64-bit (AArch64) games. Apple silicon cannot execute 32-bit ARM code,
 
 S2Arm stands on the shoulders of its community.
 
-- **Co-developers**: thank you to everyone who has opened a pull request or issue in this project. Your code, device testing and bug reports shaped S2Arm (in order of first contribution): biglawine, yyan160, DanielZhangyc, vickwv, Xc1Ym, fjack, ha7rock, yourmoonlight, qidian99, n06ody, YTwsy, wdjwxh, realskyrin, wwmogu, quancunlau, moongrant, imyinyx, s-leeq, Zhangbu, retX0, zh0ngtian, fengbird, zsakvo, 1500256797, BossaMelon, GayoZhao, sovaly, ruterfu, fyn1320068837-source, InTheManXG.
+- **Co-developers**: thank you to everyone who has opened a pull request or issue in this project. Your code, device testing and bug reports shaped S2Arm (in order of first contribution): [@biglawine](https://github.com/biglawine), [@yyan160](https://github.com/yyan160), [@DanielZhangyc](https://github.com/DanielZhangyc), [@vickwv](https://github.com/vickwv), [@Xc1Ym](https://github.com/Xc1Ym), [@fjack](https://github.com/fjack), [@ha7rock](https://github.com/ha7rock), [@yourmoonlight](https://github.com/yourmoonlight), [@qidian99](https://github.com/qidian99), [@n06ody](https://github.com/n06ody), [@YTwsy](https://github.com/YTwsy), [@wdjwxh](https://github.com/wdjwxh), [@realskyrin](https://github.com/realskyrin), [@wwmogu](https://github.com/wwmogu), [@quancunlau](https://github.com/quancunlau), [@moongrant](https://github.com/moongrant), [@imyinyx](https://github.com/imyinyx), [@s-leeq](https://github.com/s-leeq), [@Zhangbu](https://github.com/Zhangbu), [@retX0](https://github.com/retX0), [@zh0ngtian](https://github.com/zh0ngtian), [@fengbird](https://github.com/fengbird), [@zsakvo](https://github.com/zsakvo), [@1500256797](https://github.com/1500256797), [@BossaMelon](https://github.com/BossaMelon), [@GayoZhao](https://github.com/GayoZhao), [@sovaly](https://github.com/sovaly), [@ruterfu](https://github.com/ruterfu), [@fyn1320068837-source](https://github.com/fyn1320068837-source), [@InTheManXG](https://github.com/InTheManXG), [@neexuan](https://github.com/neexuan), [@Catnip202X](https://github.com/Catnip202X), [@kmmao](https://github.com/kmmao), [@Darcelsan](https://github.com/Darcelsan), [@lson-lee](https://github.com/lson-lee), [@cszwdy](https://github.com/cszwdy), [@Aoldbald](https://github.com/Aoldbald), [@potpot3](https://github.com/potpot3), [@yangxiaofei819](https://github.com/yangxiaofei819), [@nevenhsu](https://github.com/nevenhsu), [@shuangwei-Ye](https://github.com/shuangwei-Ye), [@IUMonster](https://github.com/IUMonster), [@zhanggh126](https://github.com/zhanggh126), [@xiaoweili126](https://github.com/xiaoweili126), [@shenxianmq](https://github.com/shenxianmq), [@rugal7699](https://github.com/rugal7699), [@painkiller2049](https://github.com/painkiller2049), [@tommy762](https://github.com/tommy762), [@tiannip](https://github.com/tiannip), [@Tiaoge-tou](https://github.com/Tiaoge-tou), [@skyezhangF](https://github.com/skyezhangF), [@DDDDEEP](https://github.com/DDDDEEP), [@CJohnSnow](https://github.com/CJohnSnow), [@shanaiardor](https://github.com/shanaiardor), [@wehnes](https://github.com/wehnes), [@SantaJiang](https://github.com/SantaJiang), [@orzdesu](https://github.com/orzdesu), [@shengyifan](https://github.com/shengyifan), [@QBYLHQ](https://github.com/QBYLHQ), [@kurtzou1](https://github.com/kurtzou1), [@TravelC](https://github.com/TravelC), [@f\*\*\*\*\*\*\*](https://github.com/fucknima), [@mizukico](https://github.com/mizukico), [@turtle4512](https://github.com/turtle4512), [@CrazyBunQnQ](https://github.com/CrazyBunQnQ), [@lwjailjq-spec](https://github.com/lwjailjq-spec), [@hkk818](https://github.com/hkk818), [@AirEcho825](https://github.com/AirEcho825), [@asdaffeqqr](https://github.com/asdaffeqqr), [@jazz-zzzz](https://github.com/jazz-zzzz), [@Canon329](https://github.com/Canon329), [@llpgf](https://github.com/llpgf), [@wyx813562408](https://github.com/wyx813562408), [@GirlNet](https://github.com/GirlNet), [@yangliguo7](https://github.com/yangliguo7), [@vuongtqchip](https://github.com/vuongtqchip), [@danielmx98](https://github.com/danielmx98), [@vpromise](https://github.com/vpromise), [@starlighteryuan-rgb](https://github.com/starlighteryuan-rgb), [@Jean-Zhang999](https://github.com/Jean-Zhang999), [@devinhurry](https://github.com/devinhurry), [@zhaobenshan-cmd](https://github.com/zhaobenshan-cmd), [@ethan-unplugged](https://github.com/ethan-unplugged), [@huanhuxilu](https://github.com/huanhuxilu), [@Y2JING](https://github.com/Y2JING), [@lin465](https://github.com/lin465), [@ZEERDEER](https://github.com/ZEERDEER), [@Haseenesss](https://github.com/Haseenesss), [@xavierskip](https://github.com/xavierskip), [@Levier007](https://github.com/Levier007), [@XuanLIN0224](https://github.com/XuanLIN0224), [@kaiying1994](https://github.com/kaiying1994), [@zhaozhen197](https://github.com/zhaozhen197), [@igobypc](https://github.com/igobypc), [@nimohe](https://github.com/nimohe), [@Glaucus-Kwok](https://github.com/Glaucus-Kwok), [@1614912120](https://github.com/1614912120), [@sofaseakk](https://github.com/sofaseakk), [@Eylock](https://github.com/Eylock), [@tututuhehehe](https://github.com/tututuhehehe), [@dovelflab](https://github.com/dovelflab), [@daiadong](https://github.com/daiadong), [@l1uvu](https://github.com/l1uvu), [@torg20](https://github.com/torg20), [@2k002](https://github.com/2k002), [@rzhang-tech](https://github.com/rzhang-tech), [@edwardzgy](https://github.com/edwardzgy), [@sevenspan](https://github.com/sevenspan), [@unionpacificy](https://github.com/unionpacificy), [@wendaocode](https://github.com/wendaocode), [@zhegemimahaolihai666](https://github.com/zhegemimahaolihai666), [@rhotov](https://github.com/rhotov), [@Arvinnma](https://github.com/Arvinnma), [@abissa](https://github.com/abissa), [@ckuffff](https://github.com/ckuffff), [@xiaopebaka](https://github.com/xiaopebaka), [@xiaoxiaocos](https://github.com/xiaoxiaocos), [@BTFKM](https://github.com/BTFKM), [@UKhhh](https://github.com/UKhhh), [@bagasromadon](https://github.com/bagasromadon), [@wangkoukouX](https://github.com/wangkoukouX), [@Klien-m](https://github.com/Klien-m), [@hycailxy](https://github.com/hycailxy), [@CCCGoat](https://github.com/CCCGoat), [@NJimmi](https://github.com/NJimmi), [@qooxxp](https://github.com/qooxxp), [@lhailiang20-hue](https://github.com/lhailiang20-hue), [@lucaAce1024](https://github.com/lucaAce1024), [@dejavuwl](https://github.com/dejavuwl), [@KANATA23333](https://github.com/KANATA23333), [@wowkiseki](https://github.com/wowkiseki), [@wcashew](https://github.com/wcashew), [@Chidober](https://github.com/Chidober), [@Orreroem](https://github.com/Orreroem), [@XIAMI2016](https://github.com/XIAMI2016), [@StrayDogA8](https://github.com/StrayDogA8), [@HFYKratos](https://github.com/HFYKratos), [@iriotssos](https://github.com/iriotssos), [@oneincase](https://github.com/oneincase), [@hx23840](https://github.com/hx23840).
+- **Virtual gamepad and gear menu**: the in-game gear menu and in-place gamepad editing on iOS follow the MeloNX-style design that [@neexuan](https://github.com/neexuan) brought in [#134](https://github.com/jhaizhou-ops/S2Arm/pull/134); S2Arm reimplemented it from scratch. Thanks to MeloNX for exploring this interaction on iOS.
 - **Ryujinx** (Ryujinx Team and Contributors, MIT): upstream for system services and shader translation; S2Arm's compatibility layer is built on it.
 - **[NX2Apple](https://github.com/LNPANDY/NX2Apple)** (LNPANDY, MIT): upstream of the launcher interface.
-- **[nxnative](https://github.com/seedds/nxnative)** (seedds, MIT, Copyright (c) 2026 seedds): the original work behind the direct graphics layer that connects game graphics straight to Metal. That generous release is what made the direct path possible.
+- **[nxnative](https://github.com/seedds/nxnative)** (seedds, MIT, Copyright (c) 2026 seedds): the original work behind the direct graphics layer that connects game graphics straight to Metal. That generous release is what made the direct path possible. Its fork **[kartnative](https://github.com/pahorema/kartnative)** (MIT) is where the placement-sparse tile sharing for large sparse textures comes from.
 - **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** (MIT): pioneered this technical path, bringing your own Switch game natively to iPhone, iPad, Mac, Android and HarmonyOS for the first time.
 - **Impactor** (Samara M, MIT) and **apple-codesign** (MPL-2.0): signing and installing from Windows.
 - **LNPANDY** and the original authors and contributors of the iOS library shell: the shell and its RomFS archive subsystem.
-- **ns2pro-bridge** (DanielZhangyc, MIT), **MacNativeGames** (MIT), **LumaDock** (MIT), **deko3d** (fincs, zlib), **nvn.h** (h1k421, MIT), **bcdec** (Sergii Kudlai, MIT / Unlicense), **LibHac** (Alex Barney, MIT) and **hactool** (SciresM, ISC), **SPIRV-Cross** and **Vulkan-Headers** (The Khronos Group), **SMAA** (Jorge Jimenez et al., MIT), the **Mesa** tessellator (Microsoft, MIT), **Capstone**, **LZ4**, **.NET**, **libvpx**, **libopus**, **dav1d**, and the **Noto** fonts.
+- **ns2pro-bridge** (DanielZhangyc, MIT), **MacNativeGames** (MIT), **LumaDock** (MIT), **deko3d** (fincs, zlib), **nvn.h** (h1k421, MIT), **bcdec** (Sergii Kudlai, MIT / Unlicense), **SPIRV-Cross** and **Vulkan-Headers** (The Khronos Group), **SMAA** (Jorge Jimenez et al., MIT), the **Mesa** tessellator (Microsoft, MIT), **Capstone**, **LZ4**, **.NET**, **libvpx**, **libopus**, **dav1d**, and the **Noto** fonts.
 
 Versions, full license texts and what each component does are in [NOTICE](NOTICE) and the [third-party license list](THIRD_PARTY_LICENSES.md).
+
+## Star History
+
+<a href="https://star-history.com/#jhaizhou-ops/S2Arm&Date"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jhaizhou-ops/S2Arm&type=Date&theme=dark" /><img alt="Star History" src="https://api.star-history.com/svg?repos=jhaizhou-ops/S2Arm&type=Date" /></picture></a>
 
 ## License and legal
 

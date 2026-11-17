@@ -4,7 +4,7 @@
 """Read-only checks for knowledge headings and generated collaboration policy.
 
 Policy values come from train.sh / contrib_check.sh, never from a second table.
-Use --render to print the block used in CONTRIBUTING and docs/协作循环.md.
+Use --render to print the block used in CONTRIBUTING.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import unicodedata
 
 BEGIN = '<!-- S2ARM_POLICY:BEGIN -->'
 END = '<!-- S2ARM_POLICY:END -->'
-DOCUMENTS = ('CONTRIBUTING.md', 'docs/协作循环.md')
+DOCUMENTS = ('CONTRIBUTING.md',)
 
 
 class PolicyError(ValueError):
@@ -54,7 +54,7 @@ def duplicate_headings(text):
 def train_source(repo):
     """Merge-train script is maintainer-side; S2A_PRIVATE_TOOLS points at it. None = public checkout."""
     if os.environ.get('S2A_PRIVATE_TOOLS'):
-        return Path(os.environ['S2A_PRIVATE_TOOLS']) / 'train.sh'
+        return Path(os.environ['S2A_PRIVATE_TOOLS']) / 'train' / 'train.sh'   # 11-09 列车脚本收进 private-tools 库后的唯一真值（原根目录 train.sh 是旧副本，已删）
     local = repo / 'tools/train.sh'
     return local if local.exists() else None
 
@@ -109,6 +109,8 @@ def check(repo):
         problems.append(f'规则来源：{exc}')
         return problems
     for name in DOCUMENTS:
+        if name == 'docs/协作循环.md' and not (repo / name).is_file():
+            continue   # 内部开发流程文档不进公开快照
         text = (repo / name).read_text(encoding='utf-8')
         if text.count(BEGIN) != 1 or text.count(END) != 1:
             problems.append(f'{name}: 缺少唯一生成规则块')

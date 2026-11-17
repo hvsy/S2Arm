@@ -39,7 +39,7 @@ t() { echo "[$(date +%T)] $*"; ev say ",\"msg\":\"$(jesc "$*")\""; }
 T0=$SECONDS; TS=$SECONDS; TN=; TL=
 lap() { [ -z "$TN" ] || { TL="$TL$TN	$((SECONDS - TS))
 "; t "   ${TN}完成，用时 $(prog_dur $((SECONDS - TS)))"; ev stage_end ",\"name\":\"$(jesc "$TN")\",\"ok\":true,\"elapsed\":$((SECONDS - TS))"; }
-  TN=${1:-}; TS=$SECONDS; [ -z "$TN" ] || { EVK=$((EVK + 1)); t "▶ ${TN}开始"; ev stage ",\"k\":$EVK,\"n\":$EVN,\"name\":\"$(jesc "$TN")\""; }; }   # 结尾不带参数的 lap 只收最后一步（set -u 下 $1 未定义会直接退出，10-23 Spare-host 奥德赛出完包后在这里报错、计时表没写出）
+  TN=${1:-}; TS=$SECONDS; [ -z "$TN" ] || { EVK=$((EVK + 1)); t "▶ ${TN}开始"; ev stage ",\"k\":$EVK,\"n\":$EVN,\"name\":\"$(jesc "$TN")\""; }; }   # 结尾不带参数的 lap 只收最后一步（set -u 下 $1 未定义会直接退出，10-23 Spare-host 0100000000010000出完包后在这里报错、计时表没写出）
 die() { t "🔴 $*"; [ -z "$TN" ] || ev stage_end ",\"name\":\"$(jesc "$TN")\",\"ok\":false,\"elapsed\":$((SECONDS - TS))"; ev result ",\"ok\":false,\"msg\":\"$(jesc "$*")\""; EVDONE=1; exit 1; }
 evexit() { [ -n "$EVDONE" ] || ev result ",\"ok\":false,\"msg\":\"一键出包没跑完就退出了（退出码 ${1}）\""; }   # EXIT：不经 die 的退出（exit 2 / 3、子命令红直接 exit）也给一条结果
 # 长步骤进度（10-25 维护者「速度还是好慢啊，能看到进度么？」）：各阶段往 S2A_PROGRESS（<输出>/logs/progress.tsv，tools/progress.sh）写「已完成 / 总数」，
@@ -97,7 +97,7 @@ case $SIGN in adhoc|dev) ;; *) die "--sign 只认 adhoc / dev";; esac
 # Switch 2 导出目录（主机导出的松散 base/ updates/<版本>/ dlc/<标题号>/，各含 exefs / romfs，没有 NSP / XCI、没有控制分区；11-04 维护者 给的金刚 / raiders）：
 #   源包文件夹本身或下一层有 base/exefs/main.npdm 就认作导出目录，下面 Python 就绪后由 pack/ns2_dump.py 整理成解包目录（<输出>/extract），往下同 --from-extract；不要 prod.keys
 NS2D=; [ -z "$SRC" ] || for d in "$SRC" "$SRC"/*/; do d=${d%/}; [ -f "$d/base/exefs/main.npdm" ] && { NS2D=$d; break; }; done
-# Switch 2 的 NUP 容器（一个 .nup 装本体 + 更新 + DLC，a55uka/nup v1；11-04 维护者 给的塞尔达 时之笛）：源是 .nup 文件，或文件夹里恰有一个 .nup；
+# Switch 2 的 NUP 容器（一个 .nup 装本体 + 更新 + DLC，a55uka/nup v1；11-04 维护者 给的0400486024DEC000）：源是 .nup 文件，或文件夹里恰有一个 .nup；
 #   下面 Python 就绪后由 pack/ns2_nup.py 展开成导出目录布局（<输出>/ns2_dump），再走上面导出目录同一条路；不要 prod.keys
 NUPF=; if [ -z "$NS2D" ] && [ -n "$SRC" ]; then
   if [ -f "$SRC" ]; then case $SRC in *.nup|*.NUP) NUPF=$SRC;; esac
@@ -114,17 +114,6 @@ if ! command -v zstd > /dev/null; then
   if [ "$(uname -s)" = Linux ]; then die "没有 zstd：请用系统包管理器安装 zstd（例如 apt install zstd）"
   else die "没有 zstd（解社区着色器参考库要用）：brew install zstd，或装 S2Arm.app（自带一份）"; fi
 fi
-#   .NET 10 SDK：DOTNET → PATH → ~/.dotnet（前端「一键安装」/ applenv.py --install dotnet 装的位置）；读取器的 apphost 要 DOTNET_ROOT，按 --list-sdks 给的真实 SDK 根补
-DN=${DOTNET:-$(command -v dotnet || true)}; [ -n "$DN" ] || { [ -x "$HOME/.dotnet/dotnet" ] && DN=$HOME/.dotnet/dotnet; }
-if [ -n "${S2A_PREBUILT_TOOLS:-}" ] && [ -n "${S2A_NX_UNPACK:-}" ] && [ -n "${S2A_SHELL:-}" ]; then
-  #   发版应用（启动器 pack/jobs/ipa.py 给齐预编件 / 读取器 / 随包壳）：C# 只运行不现编，有 .NET 10 运行时即可（DOTNET_ROOT 由作业环境给随包那份）
-  [ -n "$DN" ] && "$DN" --list-runtimes 2> /dev/null | grep -q '^Microsoft\.NETCore\.App 10\.' || die "应用内置 .NET 10 运行时缺失：重新安装完整的 S2Arm"
-  export DOTNET=$DN PATH="$(dirname "$DN"):$PATH"
-else
-[ -n "$DN" ] && "$DN" --list-sdks 2> /dev/null | grep -q '^10\.' || die "没有 .NET 10 SDK：python3 pack/jobs/applenv.py --install dotnet（装到 ~/.dotnet，不要管理员密码）"
-export DOTNET=$DN PATH="$(dirname "$DN"):$PATH"
-[ -n "${DOTNET_ROOT:-}" ] || export DOTNET_ROOT="$(dirname "$("$DN" --list-sdks | grep '^10\.' | tail -1 | sed 's/.*\[\(.*\)\]$/\1/')")"
-fi
 #   Python：S2A_PYTHON → S2A_PY（环境 → tools/machine.local：开发机在那里声明钉版 venv，代码里不探私人路径）→ 装着的 S2Arm.app 内置 Python（钉版、包齐）→ PATH 上的 python3；
 #   出包要的包与 App 内置 Python 同一份钉版清单
 PY=${S2A_PYTHON:-${S2A_PY:-$(bash "$P/../tools/machine.sh" get S2A_PY 2> /dev/null)}}
@@ -134,11 +123,25 @@ for c in /Applications/S2Arm.app/Contents/Resources/Runtime/python/bin/python3 "
 [ -n "$PY" ] || die "没有 Python 3：装 Python 3.11+，或用 S2A_PYTHON=<解释器> 指定（S2Arm.app 里的 Contents/Resources/Runtime/python/bin/python3 也行）"
 "$PY" -c "import sys; assert sys.version_info >= (3, 11)" 2> /dev/null || die "${PY} 版本低于 3.11：装 Python 3.11+ 或装 S2Arm.app（自带钉版 Python），或用 S2A_PYTHON=<解释器> 指定。装不进包（externally-managed / uv 托管）就建虚拟环境：python3 -m venv ~/s2a-venv && ~/s2a-venv/bin/python3 -m pip install -r launchers/macos/requirements-runtime.txt -r pack/fonts/requirements.txt，再 export S2A_PYTHON=~/s2a-venv/bin/python3"
 "$PY" -c "import capstone, lz4, numpy, PIL" 2> /dev/null || die "${PY} 缺出包要的 Python 包：${PY} -m pip install -r launchers/macos/requirements-runtime.txt（与 S2Arm.app 内置 Python 同一份钉版清单）。装不进包（externally-managed / uv 托管）就建虚拟环境：python3 -m venv ~/s2a-venv && ~/s2a-venv/bin/python3 -m pip install -r launchers/macos/requirements-runtime.txt -r pack/fonts/requirements.txt，再 export S2A_PYTHON=~/s2a-venv/bin/python3"
-export S2A_PYTHON=$PY S2A_PY=$PY
+#   选定的解释器所在目录放到 PATH 最前（#447 评审，照启动器 pack/jobs/core.py 的 env() 做）：出包链各 .sh 里的裸 python3 都落到这一个解释器，
+#   不会在装了 anaconda 的机器上拿到 PATH 最前面那个 3.9（缺包 / 版本不对，在后面某个阶段再停）
+export S2A_PYTHON=$PY S2A_PY=$PY PATH="$(dirname "$PY"):$PATH"
+#   .NET：只在源码树现编 C# 时要——发版应用（启动器 pack/jobs/ipa.py 给齐预编件 / 读取器 / 随包壳）的 C# 件全为随 App 预编的原生单文件（NativeAOT），运行不再要 .NET 运行时
+if [ -z "${S2A_PREBUILT_TOOLS:-}" ] || [ -z "${S2A_NX_UNPACK:-}" ] || [ -z "${S2A_SHELL:-}" ]; then
+  #   源码树现编 C#：SDK 版本按 compat/tree/global.json 判（#449：只 grep 10.x 会放过 10.0.301，到编 C# 时才红）：选哪个 dotnet、够不够版本、报什么，都用 pack/jobs/ipa.py
+  #   dotnet_sdk() / dotnet_missing() 那一处（applenv.py 与启动器环境检查同一判法）；它按 DOTNET → DOTNET_ROOT → ~/.dotnet → PATH → 常见安装位置找
+  #   读取器的 apphost 要 DOTNET_ROOT，按 --list-sdks 给的真实 SDK 根补（在 Python 之后查：选 SDK 用 Python 那一处判法）
+  DNR=$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); from ipa import dotnet_sdk, dotnet_missing; r, e = dotnet_sdk(); print(f"{e}\t{r}" if e else "\t" + dotnet_missing())' "$P/../pack/jobs") \
+    || die "查不了 .NET SDK（${PY} 跑 pack/jobs/ipa.py 失败）"
+  DN=${DNR%%$'\t'*}
+  [ -n "$DN" ] || die "${DNR#*$'\t'}"
+  export DOTNET=$DN PATH="$(dirname "$DN"):$PATH"
+  [ -n "${DOTNET_ROOT:-}" ] || export DOTNET_ROOT="${DNR#*$'\t'}"
+fi
 #   共享字体：没给 --fonts 就用开源替代字体（维护者 10-30：缺省开源、原版只在显式给时用；来源规则在 pack/stages/sysdata.sh，一处定）
 # 并行度按本机核数（tools/cores.sh：重烘 / 出库路数 = min(核数, 内存一半 ÷ 1.5 GB)，make 等按全部核；G04 10-23 起一键出包就按本机用满，10-25 起 refresh / ipa.sh 直调也同一处算）
 #   在本单起任何子进程（现编 nx_unpack、认游戏、解包）之前算：cores.sh 按 1 分钟负载封顶，原先放在解包之后，读到的是自己刚跑完的 8 路解包，
-#   空闲的 8 核玩家机器也只给 5 路（11-02 Spare-host 冷出马车8 直连段 1009 秒，10-30 的 8 路是 795 秒）
+#   空闲的 8 核玩家机器也只给 5 路（11-02 Spare-host 冷出0100152000022000 直连段 1009 秒，10-30 的 8 路是 795 秒）
 source "$P/../tools/cores.sh"; s2a_cores 2>&1 || die "并行度读不出（tools/cores.sh）"
 source "$P/srcs.sh"   # SRC_N = nx_unpack（按源码哈希缓存编好的那份，没有就现编）
 # 从解包目录往下（--from-extract）也要它：程序位数只由 nx_unpack --npdm-isa 判（全仓唯一一份判法）
@@ -238,13 +241,13 @@ fi
 # ③ 解包（--from-extract：用给的目录，键 = 它的 unpack.tsv + exefs/main 的内容（审计 P1-54：原先是大小 / 修改时间，保住这两样换了 main 照用旧的））
 if [ -n "$FX" ]; then
   # 键还要含 exefs 全部模块与 ctl/control.nacp 的内容：播种把它们原样克隆进产物根，而解包工具改了（如 ns2_dump 合成 nacp 补存档类别）重写这两样时 unpack.tsv 照旧不变，
-  #   只按 unpack.tsv + main 定键会不重播种、旧 nacp 进包（11-05 时之笛第二版：解包目录 nacp 已声明临时存储 128 MB，包里仍是 0 → MountTemporaryStorage 2002-1002 Break）
+  #   只按 unpack.tsv + main 定键会不重播种、旧 nacp 进包（11-05 0400486024DEC000第二版：解包目录 nacp 已声明临时存储 128 MB，包里仍是 0 → MountTemporaryStorage 2002-1002 Break）
   KM=$(cd "$FX" && for f in exefs/* ctl/control.nacp rt_shaders/*; do [ ! -f "$f" ] || printf '%s %s\n' "$(shasum -a 256 < "$f" | cut -c1-64)" "$f"; done) || die "读不出 $FX/exefs 或 ctl/control.nacp"
   # romfs/ 与追加内容（aoc/、aoc.tsv：播种同样原样克隆进产物根）也进键（审计 #1534 P1-54：原先不在键里，重解包只换了 romfs / 追加内容照用旧产物根）：
   #   目录取盘点身份（graphics/nvn/tools/romfs_list.py：相对路径 + 大小 + 修改时间纳秒，只 lstat、不读内容，27 万文件也只是盘点一遍），没有的记「-」
   KA=$(cd "$FX" && "$PY" -c 'import os, sys; sys.path.insert(0, sys.argv[1]); import romfs_list
 for d in sys.argv[2:]:
-    i = romfs_list.scan(d).identity if os.path.isdir(d) else "-"
+    i = romfs_list.scan(d).identity if romfs_list.is_dir(d) else "-"   # is_dir：romfs/ 不在、只有镜像 romfs.std 时盘点镜像（身份随镜像换而换）
     if i is None: sys.exit(1)
     print(d, i)' "$P/../graphics/nvn/tools" romfs aoc && { [ ! -f aoc.tsv ] || shasum -a 256 < aoc.tsv; }) || die "盘点不了 $FX 的 romfs/ 或 aoc/"
   K=$( { cat "$FX/unpack.tsv"; echo "$KM"; echo "$KA"; } | shasum -a 256 | cut -c1-16); X=$FX
@@ -269,7 +272,7 @@ fi
 # 直连零配置推导要的版本元数据。算法只一份：pack/direct_profile_input.py，读解包目录的 unpack.tsv 写旁注，
 #   解包阶段（pack/stages/unpack.sh extract）出包后调的是同一份。这里不再自己算版本——原先「从原件认」按 inspect JSON 算、
 #   「从解包目录认」按 unpack.tsv 的 update 补，两套算法口径不同（update 空时后者取 0，是错的值）；且每多一条出包路径就漏一次
-#   （11-03 22:42 塞尔达御天之剑HD 手测单：packq 从原件播种没补旁注，刷新停在 missing content version）。
+#   （11-03 22:42 01002DA013484000 手测单：packq 从原件播种没补旁注，刷新停在 missing content version）。
 #   目录里已有旁注（调用方给的 / 上次出的）→ 保留不覆盖；没有才按 unpack.tsv 写。
 "$PY" "$P/direct_profile_input.py" "$X" || die "直连配置版本旁注没写成（解包目录 ${X}）：解包产物太旧就用当前 nx_unpack 重新解包"
 
@@ -330,12 +333,14 @@ t "④ 出包（编 App、${SIGN} 签名、资源包）…"
 [ -z "$BUNDLE" ] || export S2A_BUNDLE_ID=$BUNDLE
 beat 出包 "$OUT/logs/ipa.log"; S2A_SIGN=$SIGN S2A_DISPLAY_SUFFIX= bash "$P/ipa.sh" "$G" > "$OUT/logs/ipa.log" 2>&1 || { unbeat; die "出包失败：$(grep '【红】' "$OUT/logs/ipa.log" | tail -1 | cut -c1-200)（$OUT/logs/ipa.log）"; }; unbeat
 PK=$(root_cur "$G")/pkg; [ -f "$PK/$G.ipa" ] && [ -f "$PK/pack/manifest.json" ] || die "出包没产出 ipa / 资源包（${PK}）"
+# 启动器（pack/jobs/ipa.py）成功时写 <输出>/shell.id：命令行一键出包同样写一份，否则启动器判「这款不是本壳出的」，装机 / 推资源包报 container_stale
+[ ! -s "$(root_cur "$G")/.shell_id" ] || printf '%s' "$(cat "$(root_cur "$G")/.shell_id")" > "$OUT/shell.id"   # 小戳直接写；rc_lint 对 cp 要判返回码，这里不需要
 
 # ⑤ 交付（APFS 克隆，不多占盘）
 lap 交付
 rm -f "$OUT/$G.ipa"
 if ! cp -c "$PK/$G.ipa" "$OUT/$G.ipa" 2> /dev/null; then cp "$PK/$G.ipa" "$OUT/$G.ipa" || die "拷 ipa 失败"; fi   # cp -c 是 APFS 克隆（macOS 才有），别处退回普通拷贝
-# 资源包按两份 index.tsv 增量交付（pack/oneclick/deliver_pack.py）：只克隆变了的、删掉新版没有的；原先整份 rm -rf + cp -cR，时之笛 18.7 万个文件每次约 4 分钟
+# 资源包按两份 index.tsv 增量交付（pack/oneclick/deliver_pack.py）：只克隆变了的、删掉新版没有的；原先整份 rm -rf + cp -cR，0400486024DEC000 18.7 万个文件每次约 4 分钟
 D=$OUT/${G}资源包
 DLV=$("$PY" "$P/oneclick/deliver_pack.py" "$PK/pack" "$D") || die "交付资源包失败（${D}）"
 IFS=$'\t' read -r NF DB DCL DRM DMODE < <(printf '%s\n' "$DLV"); SZ=$(awk -v b="$DB" 'BEGIN { printf "%.1fG", b / 1073741824 }')

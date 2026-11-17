@@ -10,8 +10,9 @@ using Path = System.IO.Path;
 
 Ryujinx.HLE.FileSystem.S2AHostFileSystem.Transaction = new S2A.Apple.SaveCommit.AppleHostDirectoryTransaction();
 
-if (args.Length == 1 && args[0] == "--describe")   // 审计 P2-11：失败原因转人话的映射，interop.py 按手算期望逐条比
+if (args.Length is 1 or 2 && args[0] == "--describe")   // 审计 P2-11：失败原因转人话的映射，interop.py 按手算期望逐条比；第二参数 = 请求里的 language（#316）
 {
+    S2A.Services.SaveTransfer.UseLanguage(args.Length == 2 ? JsonSerializer.Serialize(new { language = args[1] }) : "{}");
     foreach (var ex in new Exception[] { new IOException("disk", 28), new IOException("quota", 69), new UnauthorizedAccessException("no"), new IOException("perm", 13),
                                          new InvalidDataException("bad"), new JsonException("bad"), new IOException("other", 5), new ArgumentException("arg") })
     {
@@ -32,8 +33,11 @@ if (args.Length == 2 && args[0] == "--request")
     Console.WriteLine(S2A.Services.SaveTransfer.Execute(File.ReadAllText(args[1])));
     return;
 }
-if (args.Length != 4 || args[0] != "--create") throw new ArgumentException("--create root repository user-id");
-string root = args[1], repository = args[2], userText = args[3];
+if (args.Length != 4 || args[0] != "--create") throw new ArgumentException("--create root repository user-id[,user-id…]");
+// 用户号可给多个（逗号分隔，#623 本地玩家）：第一个照旧建账号存档 + 设备存档，其余每人再建一份账号存档（同一款游戏几个玩家）
+string root = args[1], repository = args[2];
+string[] userTexts = args[3].Split(',');
+string userText = userTexts[0];
 Directory.CreateDirectory(root);
 var horizon = new Horizon(new HorizonConfiguration());
 using var serverClient = horizon.CreatePrivilegedHorizonClient();
@@ -65,11 +69,20 @@ Check(client.Fs.Commit("account"u8));
 Check(client.Fs.Commit("device"u8));
 client.Fs.Unmount("account"u8);
 client.Fs.Unmount("device"u8);
+foreach (string more in userTexts.Skip(1))
+{
+    var other = new UserId(Convert.ToUInt64(more[..16], 16), Convert.ToUInt64(more[16..], 16));
+    Check(client.Fs.CreateSaveData(application, other, application.Value, 0x100000, 0x100000, SaveDataFlags.None));
+    Check(client.Fs.MountSaveData("player"u8, application, other));
+    Write("player:/readme.md"u8, File.ReadAllBytes(Path.Combine(repository, "README.md")));
+    Check(client.Fs.Commit("player"u8));
+    client.Fs.Unmount("player"u8);
+}
 Directory.CreateDirectory(Path.Combine(root, "system"));
 File.WriteAllText(Path.Combine(root, "system/Profiles.json"), JsonSerializer.Serialize(new
 {
     last_opened = userText,
-    profiles = new[] { new { user_id = userText, name = "Public-file interop account" } },
+    profiles = userTexts.Select((u, i) => new { user_id = u, name = i == 0 ? "Public-file interop account" : "Public-file interop player " + (i + 1) }).ToArray(),
 }));
 Console.WriteLine("Created and committed account/device saves through LibHac; payloads are repository CONTRIBUTING.md and README.md.");
 
@@ -80,4 +93,16 @@ void Write(LibHac.Common.U8Span path, byte[] bytes)
     Check(client.Fs.OpenFile(out FileHandle handle, path, OpenMode.Write));
     try { Check(client.Fs.WriteFile(handle, 0, bytes, WriteOption.Flush)); }
     finally { client.Fs.CloseFile(handle); }
+}
+
+namespace S2A.Services
+{
+    public static partial class SaveTransfer
+    {
+        // 审计 P2-177：interop.py 设 SAVE_TRANSFER_FAIL_AT=<阶段> 让恢复在该检查点抛错，核失败后不留目录
+        static partial void Checkpoint(string phase)
+        {
+            if (Environment.GetEnvironmentVariable("SAVE_TRANSFER_FAIL_AT") == phase) throw new IOException("injected failure at " + phase);
+        }
+    }
 }

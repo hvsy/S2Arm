@@ -6,6 +6,7 @@
 #   ③ 目标里没变的文件被截短（大小对不上）→ 照样重克隆（克隆 1 个），不信旧索引
 #   ④ 目标缺 manifest.json（上次中途失败）→ 整份重做
 #   ⑤ 源没有 manifest.json（资源包不完整）→ 退出非 0
+#   ⑥ #329 库内形态：源里没有 romfs.img、有 romfs.files/ → 交付 romfs.files 两个文件（内容等于源）、目标里旧格式的 romfs.img 删掉；再交付一次镜像行没变 → 不动（克隆 0）
 set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); bad=0; trap 'rm -rf "$T"' EXIT
 PY=${S2A_PY:-python3}
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
@@ -30,4 +31,28 @@ rm $T/d/manifest.json; o4=$(DP $T/s $T/d); r4=$?
 ck "④ 目标缺清单 → 整份：rc=${r4}、输出「${o4}」" '[ $r4 = 0 ] && [ "$(cut -f3,5 <<< "$o4")" = "3	整份" ] && same $T/s $T/d'
 rm $T/s/manifest.json; DP $T/s $T/d > /dev/null 2>&1; r5=$?
 ck "⑤ 源不完整 → 退出非 0：rc=${r5}" '[ $r5 != 0 ]'
+mk $T/s6 x.bin:XX; printf 'romfs.img\t5\tfeed\n' >> $T/s6/index.tsv; mkdir -p $T/s6/romfs.files/sub; printf 'IMA' > $T/s6/romfs.files/a; printf 'GE' > $T/s6/romfs.files/sub/b; printf 'X' > $T/s6/romfs.files/stray   # stray 不在索引里：不交付
+"$PY" - "$T/s6" <<'P'
+import struct, sys
+d = sys.argv[1]; names = [b'a', b'sub/b', b'ui/o']; sizes = [3, 2, 1]; offs = [0, 3, -1]   # ui/o 是覆盖层（偏移 -1），不在镜像里
+idx = b'S2ARFS01' + struct.pack('<qi', 6, 3); po = 0
+for n, z in zip(names, sizes): idx += struct.pack('<qqii', 0, z, po, len(n)); po += len(n)
+open(d + '/romfs.s2aidx', 'wb').write(idx + struct.pack('<i', po) + b''.join(names) + struct.pack('<i', 0))
+open(d + '/romfs.imgmap', 'wb').write(b'S2ARIM01' + struct.pack('<qi', 5, 3) + struct.pack('<3q', *offs))
+P
+mk $T/d6 x.bin:XX; printf 'IMAGE' > $T/d6/romfs.img; cp $T/s6/index.tsv $T/d6/index.tsv
+o6=$(DP $T/s6 $T/d6); r6=$?
+ck "⑥ 库内形态：rc=${r6}、输出「${o6}」、旧 romfs.img $([ -e $T/d6/romfs.img ] && echo 还在 || echo 删了)" '[ $r6 = 0 ] && [ ! -e $T/d6/romfs.img ] && [ "$(cat $T/d6/romfs.files/a)$(cat $T/d6/romfs.files/sub/b)" = IMAGE ] && [ ! -e $T/d6/romfs.files/stray ]'
+o7=$(DP $T/s6 $T/d6); r7=$?
+ck "⑥ 再交付一次镜像行没变：rc=${r7}、输出「${o7}」（克隆 0）" '[ $r7 = 0 ] && [ "$(cut -f3 <<< "$o7")" = 0 ]'
+# ⑦ RomFS 不落散文件：源里没有 romfs.img、没有 romfs.files/、有 romfs.std（库内镜像，不在索引里）→ 交付这一个文件（克隆 x.bin 0 个 + romfs.std 1 个 = 1），
+#    目标里上一次的 romfs.files/（⑥ 交付的）删掉；再交付一次镜像行没变 → 克隆 0；负对照：源里镜像也没有 → 退出非 0（不许静默交付一个缺 RomFS 的包）
+mk $T/s7 x.bin:XX; cp $T/s6/index.tsv $T/s6/romfs.s2aidx $T/s6/romfs.imgmap $T/s7/; printf 'STDIMAGE' > $T/s7/romfs.std
+o8=$(DP $T/s7 $T/d6); r8=$?
+ck "⑦ 镜像形态：rc=${r8}、输出「${o8}」、romfs.std「$(cat $T/d6/romfs.std 2> /dev/null)」、romfs.files $([ -e $T/d6/romfs.files ] && echo 还在 || echo 删了)" \
+  '[ $r8 = 0 ] && [ "$(cut -f3 <<< "$o8")" = 1 ] && [ "$(cat $T/d6/romfs.std)" = STDIMAGE ] && [ ! -e $T/d6/romfs.files ] && [ ! -e $T/d6/romfs.img ]'
+o9=$(DP $T/s7 $T/d6); r9=$?
+ck "⑦ 再交付一次镜像行没变：rc=${r9}、输出「${o9}」（克隆 0）" '[ $r9 = 0 ] && [ "$(cut -f3 <<< "$o9")" = 0 ]'
+rm $T/s7/romfs.std; rm -rf $T/d7; DP $T/s7 $T/d7 > /dev/null 2>&1; r10=$?
+ck "⑦ 负对照：源里镜像 / 逐文件 / romfs.img 都没有 → 退出非 0：rc=${r10}" '[ $r10 != 0 ]'
 [ $bad = 0 ] && echo "deliver_pack 单测全过" || { echo "deliver_pack 单测有不通"; exit 1; }

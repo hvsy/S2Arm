@@ -8,6 +8,7 @@
   ⑥–⑫ 实测退回（10-29 维护者）：验证账同程序号 + 构建号 + fps60 内容哈希、60 帧开着的局，持续 < 57 帧或 > 4.8 W → fps60 0；
       哈希不同（实现 / 数据改了）、实测两列为 -（那局 60 帧关）、--all-caps → 照开；能耗线常量与 score_cells 一致"""
 import os, sys, tempfile
+os.environ['S2A_CAPS_OWN'] = '1'   # 本测的是我方 60 帧 / 满屏旧口径（11-13 起发布缺省只用社区补丁，见 tests/caps_patch_only_test.py）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
 import caps_policy as cp
 
@@ -51,6 +52,13 @@ d = cp.decide(repo, root)
 chk('④b 登记「帧率达不到」（10-31）→ fps60 0、原因带信号与依据', (0, True, True), (d['fps60'][0], '帧率达不到' in d['fps60'][1], '提交线程 20 ms' in d['fps60'][1]))
 cp.engine_l1 = real
 chk('⑤ 没有 romfs 的根 → engine_l1 False、不抛', False, cp.engine_l1(root))
+# ⑤b 推导本身出错（exefs/main 是目录、读不了）→ 照旧 False 不中断出包，但错误输出要有【红】行（审计 P1-138：原先静默当「不是 Unity / UE」）
+import io, contextlib
+bad_root = tempfile.mkdtemp(); os.makedirs(os.path.join(bad_root, 'exefs', 'main')); os.makedirs(os.path.join(bad_root, 'romfs'))
+err = io.StringIO()
+with contextlib.redirect_stderr(err): r5 = cp.engine_l1(bad_root)
+chk('⑤b 推导出错 → engine_l1 False、错误输出带【红】', (False, True), (r5, '【红】' in err.getvalue()))
+shutil.rmtree(bad_root)
 # ⑥–⑫ 实测退回：期望按规则手算（< 57 帧或 > 4.8 W 才关），不跑被测实现推期望
 import caps_ledger, score_cells
 shutil.rmtree(os.path.join(repo, 'docs', '名单_能力强信号')); open(os.path.join(root, 'fps.tsv'), 'w').write('build aa\n')

@@ -26,20 +26,29 @@ public struct GameSpace: Identifiable, Equatable {
     public let name: String
     public let parts: [SpacePart]
     public let kept: [SpacePart]
+    /// 勾选组合（部件 id 排序后用「+」连）→ 删掉这几项真能腾出的字节（作业层 library.freeable：几项共用的克隆块 / 硬链接只在都勾上时算）
+    public let combos: [String: Int64]
+    /// 全勾比各项单删相加多出的字节（几项共用的部分）；0 = 各项互不共用
+    public let sharedBytes: Int64
 
-    public init(gameId: String, name: String, parts: [SpacePart], kept: [SpacePart]) {
-        self.gameId = gameId; self.name = name; self.parts = parts; self.kept = kept
+    public init(gameId: String, name: String, parts: [SpacePart], kept: [SpacePart], combos: [String: Int64] = [:], sharedBytes: Int64 = 0) {
+        self.gameId = gameId; self.name = name; self.parts = parts; self.kept = kept; self.combos = combos; self.sharedBytes = sharedBytes
     }
 
     init?(json g: [String: Any]) {
         guard let id = g["gameId"] as? String, !id.isEmpty else { return nil }
         self.init(gameId: id, name: g["name"] as? String ?? id,
                   parts: (g["parts"] as? [[String: Any]] ?? []).compactMap(SpacePart.init(json:)),
-                  kept: (g["kept"] as? [[String: Any]] ?? []).compactMap(SpacePart.init(json:)))
+                  kept: (g["kept"] as? [[String: Any]] ?? []).compactMap(SpacePart.init(json:)),
+                  combos: (g["combos"] as? [String: Any] ?? [:]).compactMapValues { ($0 as? NSNumber)?.int64Value },
+                  sharedBytes: (g["sharedBytes"] as? NSNumber)?.int64Value ?? 0)
     }
 
-    /// 勾了这些部件一共能释放多少。
-    public func bytes(of ids: Set<String>) -> Int64 { parts.filter { ids.contains($0.id) }.reduce(0) { $0 + $1.bytes } }
+    /// 勾了这些部件一共能释放多少：按作业层的组合账查（共用块不重复算、也不漏算）；没有组合账时退回各项相加。
+    public func bytes(of ids: Set<String>) -> Int64 {
+        if ids.isEmpty { return 0 }
+        return combos[ids.sorted().joined(separator: "+")] ?? parts.filter { ids.contains($0.id) }.reduce(0) { $0 + $1.bytes }
+    }
 }
 
 /// 一次释放的结局（spaceFree 作业 result）：各部件删掉的字节与合计。
@@ -47,6 +56,47 @@ public struct SpaceFreed: Equatable {
     public let gameId: String
     public let parts: [SpacePart]
     public let freedBytes: Int64
+}
+
+/// 存储总览（storageOverview 作业，pack/jobs/sizes.py overview）：各存放位置的总量 / 剩余 / S2Arm 已用，公共件各占多少，每款大小。
+public struct StorageOverview: Equatable {
+    public struct Location: Identifiable, Equatable {
+        public let id: String
+        public let path: String
+        public let volume: String
+        public let connected: Bool
+        public let isDefault: Bool
+        /// 没连上时为 nil
+        public let totalBytes: Int64?
+        public let freeBytes: Int64?
+        public let usedBytes: Int64?
+    }
+    public struct Game: Identifiable, Equatable {
+        public var id: String { gameId }
+        public let gameId: String
+        public let name: String
+        public let state: String
+        public let sizes: GameSizes
+    }
+    public let locations: [Location]
+    /// hosts / ipa / toolCache / temp / logs（作业层顺序）
+    public let shared: [SpacePart]
+    public let games: [Game]
+
+    public init(json r: [String: Any]) {
+        func n(_ v: Any?) -> Int64? { (v as? NSNumber)?.int64Value }
+        locations = (r["locations"] as? [[String: Any]] ?? []).compactMap { l in
+            guard let id = l["id"] as? String, let path = l["path"] as? String else { return nil }
+            return Location(id: id, path: path, volume: l["volume"] as? String ?? "", connected: l["connected"] as? Bool ?? false,
+                            isDefault: l["default"] as? Bool ?? false, totalBytes: n(l["totalBytes"]), freeBytes: n(l["freeBytes"]), usedBytes: n(l["usedBytes"]))
+        }
+        shared = (r["shared"] as? [[String: Any]] ?? []).compactMap(SpacePart.init(json:))
+        games = (r["games"] as? [[String: Any]] ?? []).compactMap { g in
+            guard let id = g["gameId"] as? String, !id.isEmpty else { return nil }
+            return Game(gameId: id, name: g["name"] as? String ?? id, state: g["state"] as? String ?? "none",
+                        sizes: GameSizes(catalog: g["sizes"] as? [String: Any] ?? [:]))
+        }
+    }
 }
 
 /// 释放空间：spaceSurvey 列每款按部件的占用，spaceFree 删勾选的部件（直接删、不进废纸篓；有任务在跑作业层拒绝）。
@@ -64,6 +114,12 @@ public final class SpaceService {
         if let gameId { extra["gameId"] = gameId }
         let result = try await client.perform("spaceSurvey", extra: extra).result
         return (result["games"] as? [[String: Any]] ?? []).compactMap(GameSpace.init(json:))
+    }
+
+    /// 存储总览（storageOverview）。没配游戏库直接抛错，不起作业。
+    public func overview() async throws -> StorageOverview {
+        guard !client.environment.library.isEmpty else { throw JobClientError(LibraryProvider.noLibraryMessage) }
+        return StorageOverview(json: try await client.perform("storageOverview").result)
     }
 
     /// 删这款勾选的部件。没勾 / 没配游戏库不起作业。作业层拒绝（另一个任务在用游戏库）抛 JobFailure，message 是作业层原话。

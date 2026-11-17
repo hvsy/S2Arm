@@ -2,12 +2,12 @@
 # 能力关 / 开对照局（名单线 10-28 梳理「合 2」：60 帧与满屏的 Mac 读数共用一个入口，取代各次手写的一次性起局脚本）：
 #   bash tools/ab_pair.sh <款> fps60 [局目录]
 #   bash tools/ab_pair.sh <款> widen:<档位> [局目录]      档位 19.5:9 / 16:10 / 1.42 / 4:3（同 docs/名单_满屏比例/ 表头）
-# 同根、同存档、同进局路线（tools/entry_check.sh，掌机档）先关后开各一局，然后跑该能力的判据，最后一行打印可登记的结论：
+# 同根、同存档、同进局路线（维护方 entry_check.sh，掌机档）先关后开各一局，然后跑该能力的判据，最后一行打印可登记的结论：
 #   fps60  → S2A_FPS60=0 / 1 + S2A_AP_SPEED=1（MARK 后逻辑速度探测），判据 tools/fps_speed_judge.py（画面横移速度比 ρ≈1 绿、≈帧率倍数红）→ docs/名单_60帧/ 的「逻辑速度」
 #   widen  → S2A_WIDEN_VERIFIED=0 / 1 + 档位屏幕尺寸，判据 tools/widen_accept.py（关局 MARK 截图当 16:9 对照）→ docs/名单_满屏比例/ 一行（平台 Mac）；
 #            路线有 SHOT:scene_<名>（读盘页锚后固定帧的游戏场景）时两局同名截图当主判据对，MARK 帧只认「不过」；
 #            另把开局进局路线沿途存的其余截图（shots/*.png，菜单页）逐张量占宽 / 占高 / 黑边，任一张不过整档不过
-#            （10-28 马车8 4:3：比赛 MARK 帧满屏，轮胎菜单页占高 75.4%、上下黑带——只判 MARK 漏菜单缺陷）
+#            （10-28 0100152000022000 4:3：比赛 MARK 帧满屏，轮胎菜单页占高 75.4%、上下黑带——只判 MARK 漏菜单缺陷）
 # 两局任一没到 MARK 就不判（退出 3），不拿半截局出结论。判据退出码原样透传：0 过 / 绿，1 不过 / 红，2 未验 / 判不出。
 # --rejudge（放在最前）：不起局，对已跑完的同一局目录（第 3 个参数必给）重判——判据改了不重跑局。
 # --write（放在最前，可与 --rejudge 同用）：满屏整档结论写进 docs/名单_满屏比例/，全过且没有不过时补 verified.tsv（widen_accept.py --write，只加不删）。
@@ -43,7 +43,7 @@ TID=$(LC_ALL=C grep -a -o -m1 '程序号 [0-9a-f]\{16\}' "$D/on/host.log" | awk 
 BID=$(LC_ALL=C grep -a -o -m1 '主程序构建号 [0-9a-f]\{32\}' "$D/on/host.log" | awk '{print $2}')
 W=("$PY" "$R/tools/widen_accept.py" --game "$G" --tid "${TID:-0000000000000000}" --build "${BID:-0}" --profile "${CAP#widen:}" --platform Mac)
 # 主判据对：路线 SHOT:scene_<名> 两局同名截图（读盘页锚后同一帧拍 = 同一游戏时刻）优先，没有才用 MARK 帧——MARK 落在哪一刻取决于
-#   探测前视觉判读等了多久（10-28 马车8 4:3：开局一题等 52.6 秒，两局 MARK 差 2684 帧、比赛不同时刻，拉伸量不出）
+#   探测前视觉判读等了多久（10-28 0100152000022000 4:3：开局一题等 52.6 秒，两局 MARK 差 2684 帧、比赛不同时刻，拉伸量不出）
 P=(); for f in "$D"/on/shots/scene_*.png; do [ -f "$f" ] && [ -f "$D/off/shots/${f##*/}" ] && P+=("$f" "$D/off/shots/${f##*/}"); done
 P+=("$D/on/ap_mark.png" "$D/off/ap_mark.png")
 final=$("${W[@]}" --image "${P[0]}" --reference "${P[1]}" --host-log "$D/on/host.log"); rc=$?

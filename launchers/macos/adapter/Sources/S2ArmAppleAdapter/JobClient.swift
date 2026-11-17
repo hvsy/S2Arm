@@ -17,6 +17,8 @@ public struct JobEnvironment: Equatable {
     public var pythonPath: String?
     /// 旧启动器导出页记住的平台勾选（preferences.exportTargets）：新前端还没存过自己的勾选时接着用它。
     public var exportTargets: [String]?
+    /// 启动器界面语言（zh-Hans / en）：每个作业请求带上 uiLanguage，作业层据此出玩家看得到的文件名 / 说明（自签导出的文件夹与安装说明等）；前端随界面语言写
+    public var uiLanguage: String?
 
     public init(privateRoot: URL, resources: URL, engineDir: String? = nil, library: String = "", libraryId: String = "",
                 developerDir: String = "", fontsDir: String? = nil, devHud: Bool = false, metalHud: Bool = false,
@@ -38,7 +40,7 @@ public struct JobEnvironment: Equatable {
         var env = JobEnvironment(privateRoot: privateRoot, resources: resources, buildId: buildId)
         guard let data = try? Data(contentsOf: privateRoot.appendingPathComponent("preferences.json")),
               let p = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return env }
-        env.library = p["library"] as? String ?? ""
+        env.library = S2ArmPaths.library(privateRoot: privateRoot, saved: p["library"] as? String ?? "")   // 旧默认库已搬到 ~/S2Arm 时用新位置
         env.libraryId = p["libraryId"] as? String ?? ""
         env.developerDir = p["developerDir"] as? String ?? ""
         env.engineDir = p["engineDir"] as? String
@@ -66,7 +68,6 @@ public struct JobEnvironment: Equatable {
         do {
             try FileManager.default.createDirectory(at: privateRoot, withIntermediateDirectories: true)
             try JSONSerialization.data(withJSONObject: p, options: [.sortedKeys]).write(to: file, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         } catch {
             throw JobClientError("游戏库已建好，但设置没能写进磁盘（\(error.localizedDescription)）：请检查磁盘空间和权限后再换一次。")
         }
@@ -75,8 +76,12 @@ public struct JobEnvironment: Equatable {
 
 public struct JobClientError: Error, Equatable, LocalizedError {
     public let message: String
-    public init(_ message: String) { self.message = message }
+    /// 界面据此给出动作（bundle_incomplete：App 包不完整 → 「下载完整安装包」按钮）；没有动作的错误为 nil
+    public let code: String?
+    public init(_ message: String, code: String? = nil) { self.message = message; self.code = code }
     public var errorDescription: String? { message }
+    /// App 包里缺了随包的东西（内置 Python 等）：多半是旧版应用内更新回滚把正在跑的包换掉了一半，只有重装完整包能好
+    public static let bundleIncomplete = "bundle_incomplete"
 }
 
 /// 作业层的一行事件（pack/jobs/core.py emit）。schema 不是 1 的行不认。
@@ -107,7 +112,8 @@ public struct JobEvent {
 
 /// 一次作业的结局。
 public struct JobOutcome {
-    public enum State: String { case completed, failed, cancelled, interrupted }
+    /// paused：出包编排停在要玩家处理的点上（磁盘满 / 启动器退出，剃刀 H13 pack/jobs/export_plan.py），不算完成也不算失败
+    public enum State: String { case completed, failed, cancelled, interrupted, paused }
     public let taskId: String
     public let state: State
     public let exitCode: Int32
@@ -160,7 +166,7 @@ public final class JobClient {
     public func pythonExecutable() throws -> URL {
         let bundled = environment.resources.appendingPathComponent("Runtime/python/bin/python3")
         if fileManager.isExecutableFile(atPath: bundled.path) { return bundled }
-        if environment.engineBundle != nil { throw JobClientError("应用内置 Python 缺失，请重新安装完整应用。") }
+        if environment.engineBundle != nil { throw JobClientError("应用内置 Python 缺失，请重新安装完整应用。", code: JobClientError.bundleIncomplete) }
         if let selected = environment.pythonPath, !selected.isEmpty {
             guard fileManager.isExecutableFile(atPath: selected) else { throw JobClientError("设置中的 Python 不可执行，请重新选择。") }
             return URL(fileURLWithPath: selected)
@@ -180,8 +186,8 @@ public final class JobClient {
         return checkout
     }
 
-    /// 请求体（schema 1）：字段与旧 Store.worker 一一对应；extra 覆盖同名字段。不带 gameLanguage / docked（11-07 维护者 删游戏选项）：
-    /// 作业层起局跟 Mac 系统首选语言、主机模式（pack/jobs/build.py runtime_env）。
+    /// 请求体（schema 1）：字段与旧 Store.worker 一一对应；extra 覆盖同名字段。不带 gameLanguage / docked：
+    /// 逐款的游戏语言 / 主机模式在启动设置里选（作业层 community 存这款的 launch.json、起局 launch_env 转成宿主变量；11-14 维护者确认玩家可选，推翻 11-07 的「不给玩家选」）；没选过 = 跟 Mac 系统首选语言、主机模式。
     public func request(id: String, operation: String, extra: [String: Any] = [:]) -> [String: Any] {
         let env = environment
         var req: [String: Any] = [
@@ -192,6 +198,9 @@ public final class JobClient {
             "devHud": env.devHud, "metalHud": env.metalHud, "buildId": env.buildId,
             "parentPid": Int(pid),
         ]
+        // 界面语言照原样带、由作业层认（install.py：中文界面用中文定名，其余英文；build.py：六门之外不设）。原先只带 zh-Hans / en，
+        //   法 / 日 / 西 / 繁中界面整个不带，作业层回落成中文：自签导出文件夹与说明成了中文（#502，11-16 维护者）
+        if let lang = env.uiLanguage, !lang.isEmpty { req["uiLanguage"] = lang }   // extra 带了（起局）照 extra
         extra.forEach { req[$0] = $1 }
         if let bundle = env.engineBundle { req["engineBundle"] = bundle.path; req["engineDir"] = bundle.path }
         // 环境准备不依赖游戏库：旧游戏库所在盘没插着时也要能跑
@@ -210,10 +219,82 @@ public final class JobClient {
         return env
     }
 
+
+    /// 跑 updater.py 的一条命令，逐行交 JSON；结束时返回最后一行。
+    private func runUpdater(_ command: [String], onEvent: @escaping @Sendable ([String: Any]) -> Void = { _ in }) async -> [String: Any]? {
+        await runJobsScript("updater.py", command, onEvent: onEvent)
+    }
+
+    /// 批量出包的批次（pack/jobs/batch.py，Mac / Windows 共用）：show / create / mark / recover / cancel / resume / retry / clear，
+    ///   返回 {batch, next, summary}（没有批次 → 空字典）；起不来返回 nil
+    public func batch(_ command: String, _ arguments: [String] = []) async -> [String: Any]? {
+        await runJobsScript("batch.py", [command, "--private-root", environment.privateRoot.path] + arguments)
+    }
+
+    /// 跑 pack/jobs 下的一个小脚本（updater.py / batch.py），逐行交 JSON；结束时返回最后一行
+    private func runJobsScript(_ script: String, _ command: [String], onEvent: @escaping @Sendable ([String: Any]) -> Void = { _ in }) async -> [String: Any]? {
+        guard let python = try? pythonExecutable(), let entry = try? jobEntry().deletingLastPathComponent().appendingPathComponent(script) else { return nil }
+        final class Last: @unchecked Sendable { let lock = NSLock(); var value: [String: Any]? }
+        let last = Last()
+        return await withCheckedContinuation { continuation in
+            do {
+                _ = try runner.start(executable: python, arguments: ["-B", "-I", entry.path] + command, environment: processEnvironment(),
+                                     onLine: { line in
+                                         guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { return }
+                                         last.lock.lock(); last.value = object; last.lock.unlock()
+                                         onEvent(object)
+                                     }, onStderr: { _ in },
+                                     onExit: { _ in last.lock.lock(); let value = last.value; last.lock.unlock(); continuation.resume(returning: value) })
+            } catch { continuation.resume(returning: nil) }
+        }
+    }
+
+    /// 打开时要给玩家看什么（pack/jobs/updater.py inbox，两端共用「永远只给最新一期」）：
+    ///   {popup?: {kind: update|afterUpdate, version, notes?}, banner?: 公告, messages: [...], unread, update: 查版本结果}；起不来返回 nil，不打扰玩家
+    public func inbox(current: String) async -> [String: Any]? {
+        let result = await runUpdater(["inbox", "--private-root", environment.privateRoot.path, "--platform", "mac", "--current", current])
+        return result?["messages"] is [Any] ? result : nil
+    }
+
+    /// 玩家关掉了：update = 「有新版」那版（以后再说），after = 「这版更新了什么」那版，notice = 看过的最新一条公告号，feature = 看过的新功能大窗期号
+    public func inboxSeen(update: String? = nil, after: String? = nil, notice: String? = nil, feature: String? = nil) async {
+        var command = ["inbox-seen", "--private-root", environment.privateRoot.path]
+        if let update { command += ["--update", update] }
+        if let after { command += ["--after", after] }
+        if let notice { command += ["--notice", notice] }
+        if let feature { command += ["--feature", feature] }
+        _ = await runUpdater(command)
+    }
+
+    /// 下载、校验、解开新版（不碰正在用的安装目录）。最后一行 state = ready 或 failed。
+    /// 最近一次失败作业的错误摘要（作业层 report.py，Mac / Windows 共用）。没有作业记录时返回 nil，由界面退回基本信息。
+    public func errorReport(gameID: String?, operations: [String], extra: [String: Any]) async -> String? {
+        guard let python = try? pythonExecutable(), let entry = try? jobEntry() else { return nil }
+        var arguments = ["-B", "-I", entry.path, "report", "--private-root", environment.privateRoot.path]
+        if let gameID { arguments += ["--game", gameID] }
+        if !operations.isEmpty { arguments += ["--operations", operations.joined(separator: ",")] }
+        var env = processEnvironment()
+        if let data = try? JSONSerialization.data(withJSONObject: extra) { env["S2A_REPORT_EXTRA"] = String(decoding: data, as: UTF8.self) }
+        final class Output: @unchecked Sendable {
+            private let lock = NSLock(); private var lines: [String] = []
+            func add(_ line: String) { lock.lock(); lines.append(line); lock.unlock() }
+            var text: String { lock.lock(); defer { lock.unlock() }; return lines.joined(separator: "\n") }
+        }
+        let output = Output()
+        return await withCheckedContinuation { continuation in
+            do {
+                _ = try runner.start(executable: python, arguments: arguments, environment: env,
+                                     onLine: { output.add(String(decoding: $0, as: UTF8.self)) }, onStderr: { _ in },
+                                     onExit: { continuation.resume(returning: $0 == 0 ? output.text : nil) })
+            } catch { continuation.resume(returning: nil) }
+        }
+    }
+
     /// 交一个作业。onEvent / onFinish 都在 callbackQueue 上、按作业输出顺序到达；onFinish 只来一次、在最后。
     /// 起不来（缺 Python / 入口 / 写不进请求）直接抛错，不回调。
     @discardableResult
-    public func start(operation: String, extra: [String: Any] = [:], id: String = UUID().uuidString.lowercased(),
+    /// secrets：只给这一个作业进程的环境变量（开发者证书密码，pack/jobs/devcert.py ⑤）；不进请求文件，作业层一起来就从环境摘掉
+    public func start(operation: String, extra: [String: Any] = [:], id: String = UUID().uuidString.lowercased(), secrets: [String: String] = [:],
                       onEvent: @escaping (JobEvent) -> Void = { _ in },
                       onFinish: @escaping (JobOutcome) -> Void = { _ in }) throws -> JobHandle {
         let python = try pythonExecutable()
@@ -221,11 +302,10 @@ public final class JobClient {
         let dir = environment.privateRoot.appendingPathComponent("requests")
         let file = dir.appendingPathComponent(id + ".json")
         do {
-            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            // 系统缺省权限（~/Library 本来就只归当前用户；11-16 维护者：不再自设权限）
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
             let data = try JSONSerialization.data(withJSONObject: request(id: id, operation: operation, extra: extra))
             try data.write(to: file, options: .atomic)
-            // 作业层只认本人所有、0600 的请求（winproc.request_is_private）
-            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         } catch {
             throw JobClientError("无法写入任务请求：\(error.localizedDescription)")
         }
@@ -236,7 +316,8 @@ public final class JobClient {
         do {
             process = try runner.start(
                 executable: python, arguments: ["-B", "-I", entry.path, "run", "--request", file.path],
-                environment: processEnvironment(),
+                environment: processEnvironment().merging(secrets) { _, s in s },
+                automatic: JobTrigger.automaticOperations.contains(operation),
                 onLine: { line in
                     guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { return }
                     guard let event = JobEvent(json: object) else {
@@ -281,7 +362,10 @@ public final class JobClient {
                 return JobOutcome(taskId: id, state: .cancelled, exitCode: exitCode, message: "任务已取消。",
                                   result: [:], diagnostics: [], stderr: errorText)
             }
-            return JobOutcome(taskId: id, state: .interrupted, exitCode: exitCode, message: rejection ?? JobOutcome.interruptedMessage,
+            // 进程一启动就退出时没有日志可看：把错误输出的末尾带上，玩家和错误摘要才有线索
+            let tail = errorText.trimmingCharacters(in: .whitespacesAndNewlines).suffix(600)
+            let interrupted = tail.isEmpty ? JobOutcome.interruptedMessage : JobOutcome.interruptedMessage + "\n" + tail
+            return JobOutcome(taskId: id, state: .interrupted, exitCode: exitCode, message: rejection ?? interrupted,
                               result: [:], diagnostics: [], stderr: errorText)
         }
     }

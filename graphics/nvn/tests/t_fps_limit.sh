@@ -19,7 +19,7 @@ mkdir -p "$out/host"
 make -j1 -C "$root/graphics/nvn" mac OUT="$out/nvn" > "$out/nvn-build.log" 2>&1
 make -j1 -C "$root/graphics/metal" mac OUT="$out/gal" > "$out/gal-build.log" 2>&1
 make -j1 -C "$root/graphics/dsx" mac OUT="$out/dsx" > "$out/dsx-build.log" 2>&1   # 直连翻译库（翻译段 + SPIRV-Cross，11-08 从 libnxgal 拆出）
-common=(-O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" -I"$root/runtime/include")
+common=(-O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" -I"$root/runtime/include" -I"$root/runtime/ns2pro/include" -DNS2_SCAN_SECONDS=60)   # Mac 前端源文件含 Switch 2 Pro 连接（macos/ns2_controller.c、runtime/ns2pro，#277），同 launchers/macos/build.mk
 objects=()
 for src in "$root"/runtime/src/*.c "$root"/runtime/src/*.S "$root/platform/apple/plat_apple.c" "$root/graphics/track/track.c" "$root/graphics/track/glue.c"; do
     rel=${src#"$root"/}
@@ -36,14 +36,15 @@ for rel in "${front_srcs[@]}"; do
     xcrun --sdk macosx clang "${common[@]}" -fobjc-arc -c "$root/$rel" -o "$object" >> "$out/host-build.log" 2>&1
     objects+=("$object")
 done
-weak_output=$(printf '%s\n' 'fps-limit-weak:;@echo $(NVN_TEST_WEAK)' | make -s -f "$root/runtime/build.mk" -f - fps-limit-weak)
+# 原生层链接库同生产（runtime/build.mk 的 HOST_LIBS：Foundation、Security 等）：本脚本整目录编 runtime/src，手写框架表会漏新依赖（11-17 selfsign.c 加 Security 后这里链接红）
+weak_output=$(printf '%s\n' 'fps-limit-weak:;@echo $(NVN_TEST_WEAK) $(HOST_LIBS)' | make -s -f "$root/runtime/build.mk" -f - fps-limit-weak)
 read -r -a weak_flags <<< "$weak_output"
 xcrun --sdk macosx clang "${common[@]}" -std=gnu11 -fobjc-arc \
     -I"$root/graphics/nvn/gfx/nvn" -I"$root/graphics/nvn/gfx/nvn/include" -I"$root/graphics/nvn/host" \
     -I"$root/graphics/nvn/third_party/vulkan-headers/include" \
     "$test_root/graphics/nvn/tests/t_fps_limit.m" "${objects[@]}" "$out/nvn/mac/libnvn.a" "$out/gal/mac/libnxgal.a" "$out/dsx/mac/libdsx.a" "$widen" \
     -o "$out/t_fps_limit" -Wl,-dead_strip -Wl,-export_dynamic -Wl,-u,_s2a_mac_front_layer -Wl,-u,_nxgal_gpu_hold "${weak_flags[@]}" \
-    -Wl,-rpath,"$(dirname "$widen")" -framework AppKit -framework GameController -framework Metal -framework Foundation \
+    -Wl,-rpath,"$(dirname "$widen")" -framework AppKit -framework GameController -framework CoreHaptics -framework CoreBluetooth -framework IOKit -framework Metal -framework Foundation \
     -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -lc++ > "$out/link.log" 2>&1
 shasum -a 256 "$test_root/graphics/nvn/tests/t_fps_limit.m" "${objects[@]}" "$out/nvn/mac/libnvn.a" "$out/gal/mac/libnxgal.a" "$out/dsx/mac/libdsx.a" "$widen" "$out/t_fps_limit" > "$out/link-inputs.sha256"
 if [[ ${FPS_BUILD_ONLY:-0} == 1 ]]; then exit 0; fi

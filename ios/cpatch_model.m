@@ -1,10 +1,11 @@
 #import "cpatch_model.h"
+#import "s2a_l10n.h"
 
 NSString *const S2ACPatchDefaultsKey = @"S2ACommunityPatches";
-NSString *const S2ACPatchNotice = @"宽屏和 60 帧会提高系统负载和耗电，换取更好的游玩体验，低配设备请谨慎选择";
 
 @implementation S2ACPatchItem
 - (BOOL)followsFps60 { return [self.ident hasPrefix:@"fps:"]; }
+- (BOOL)followsFullscreen { return [self.ident hasPrefix:@"wsauto:"]; }
 @end
 @implementation S2ACPatchGroup
 @end
@@ -27,42 +28,65 @@ NSString *S2ACPatchClassify(NSString *name, NSString *category, NSString *ident)
 
 NSString *S2ACPatchTitle(NSString *name, NSString *group) {
     NSString *fps = cap(name, @"(\\d+)\\s*fps", 1);
-    if (has(name, @"split\\s*screen") && fps) return [NSString stringWithFormat:@"强制 %@ 帧（分屏）", fps];
-    if (has(name, @"present interval|swap interval")) return [NSString stringWithFormat:@"%@ 帧（交换间隔 2→1）", cap(name, @"->\\s*(\\d+)\\s*fps", 1) ?: @"60"];
-    if (has(name, @"enabler") && fps) return [NSString stringWithFormat:@"%@ 帧（启用钩子）", fps];
-    if (has(name, @"\\d+\\s*fps in game") && has(name, @"cutscene")) return [NSString stringWithFormat:@"游戏中 %@ 帧（过场 %@ 帧）", fps, cap(name, @"(\\d+)\\s*fps\\s*cutscene", 1) ?: @"30"];
-    if (fps) return [NSString stringWithFormat:@"%@ 帧", fps];
+    if (has(name, @"split\\s*screen") && fps) return [NSString stringWithFormat:S2AL(@"cpatch.title.splitScreen"), fps];
+    if (has(name, @"present interval|swap interval")) return [NSString stringWithFormat:S2AL(@"cpatch.title.swapInterval"), cap(name, @"->\\s*(\\d+)\\s*fps", 1) ?: @"60"];
+    if (has(name, @"enabler") && fps) return [NSString stringWithFormat:S2AL(@"cpatch.title.enabler"), fps];
+    if (has(name, @"\\d+\\s*fps in game") && has(name, @"cutscene")) return [NSString stringWithFormat:S2AL(@"cpatch.title.inGame"), fps, cap(name, @"(\\d+)\\s*fps\\s*cutscene", 1) ?: @"30"];
+    if (fps) return [NSString stringWithFormat:S2AL(@"cpatch.title.fps"), fps];
     NSString *w = cap(name, @"\\b(\\d{3,4})\\s*x\\s*(\\d{3,4})\\b", 1), *h = cap(name, @"\\b(\\d{3,4})\\s*x\\s*(\\d{3,4})\\b", 2);
-    if (w) return [NSString stringWithFormat:@"分辨率 %@×%@%@", w, h, has(name, @"docked") ? @"（主机模式）" : has(name, @"handheld") ? @"（掌机模式）" : @""];
-    if (has(name, @"depth of field|\\bdof\\b")) return has(name, @"remov|disabl") ? @"去景深" : has(name, @"improv") ? @"改进景深" : @"景深调整";
-    if (has(name, @"dynamic resolution") && has(name, @"disabl|remov")) return @"关动态分辨率";
-    if (has(name, @"resolution scaling") && has(name, @"disabl|remov")) return @"关分辨率缩放（固定分辨率）";
-    if (has(name, @"lod\\s*bias")) return @"改进 LOD 偏移";
-    if (has(name, @"motion blur") && has(name, @"remov|disabl")) return @"去动态模糊";
-    if (has(name, @"outline") && has(name, @"remov|disabl")) return @"去角色描边";
-    if (has(name, @"shadow resolution") && has(name, @"increas|improv")) return @"提高阴影分辨率";
-    if (has(name, @"cutscene") && has(name, @"effect") && has(name, @"remov|disabl")) return @"去过场特效";
+    if (w) return [NSString stringWithFormat:S2AL(@"cpatch.title.resolution"), w, h, has(name, @"docked") ? S2AL(@"cpatch.title.docked") : has(name, @"handheld") ? S2AL(@"cpatch.title.handheld") : @""];
+    if (has(name, @"depth of field|\\bdof\\b")) return has(name, @"remov|disabl") ? S2AL(@"cpatch.title.dofRemove") : has(name, @"improv") ? S2AL(@"cpatch.title.dofImprove") : S2AL(@"cpatch.title.dofTweak");
+    if (has(name, @"dynamic resolution") && has(name, @"disabl|remov")) return S2AL(@"cpatch.title.noDynamicRes");
+    if (has(name, @"resolution scaling") && has(name, @"disabl|remov")) return S2AL(@"cpatch.title.noResScaling");
+    if (has(name, @"lod\\s*bias")) return S2AL(@"cpatch.title.lodBias");
+    if (has(name, @"motion blur") && has(name, @"remov|disabl")) return S2AL(@"cpatch.title.noMotionBlur");
+    if (has(name, @"outline") && has(name, @"remov|disabl")) return S2AL(@"cpatch.title.noOutlines");
+    if (has(name, @"shadow resolution") && has(name, @"increas|improv")) return S2AL(@"cpatch.title.shadowRes");
+    if (has(name, @"cutscene") && has(name, @"effect") && has(name, @"remov|disabl")) return S2AL(@"cpatch.title.noCutsceneFx");
     NSString *ratio = cap(name, @"\\b(21:9|32:9|16:10)\\b", 1);
-    if (ratio) return [@"宽屏 " stringByAppendingString:ratio];
-    if (has(name, @"ultra\\s*wide|widescreen|aspect")) return @"超宽屏";
-    if (has(name, @"\\bgraphics?\\b")) return @"画面增强";
-    return [group isEqual:@"widescreen"] ? @"宽屏补丁" : [group isEqual:@"fps"] ? @"帧率补丁" : @"画面补丁";
+    if (ratio) return [NSString stringWithFormat:S2AL(@"cpatch.title.ratio"), ratio];
+    if (has(name, @"ultra\\s*wide|widescreen|aspect")) return S2AL(@"cpatch.title.ultrawide");
+    if (has(name, @"\\bgraphics?\\b")) return S2AL(@"cpatch.title.graphics");
+    return [group isEqual:@"widescreen"] ? S2AL(@"cpatch.title.widescreenPatch") : [group isEqual:@"fps"] ? S2AL(@"cpatch.title.fpsPatch") : S2AL(@"cpatch.title.gfxPatch");
+}
+
+// 画幅数 → 常见写法（1.6000 → 16:10、2.3333 → 21:9）；对不上的写两位小数
+NSString *S2ACPatchRatioText(double a) {
+    static const int r[][2] = {{16, 10}, {21, 9}, {32, 9}, {3, 2}, {4, 3}, {16, 9}, {5, 4}, {18, 9}, {19, 9}, {20, 9}, {24, 10}, {48, 9}, {1, 1}};
+    for (unsigned i = 0; i < sizeof r / sizeof r[0]; i++) if (fabs(a - (double)r[i][0] / r[i][1]) < 0.005) return [NSString stringWithFormat:@"%d:%d", r[i][0], r[i][1]];
+    return [NSString stringWithFormat:@"%.2f:1", a];
 }
 
 NSArray<S2ACPatchGroup *> *S2ACPatchGroupsFromTSV(NSString *text) {
-    static NSString *const kinds[] = {@"widescreen", @"fps", @"gfx"}, *const titles[] = {@"宽屏", @"60 帧", @"画面"};
+    static NSString *const kinds[] = {@"widescreen", @"fps", @"gfx"};
     NSMutableArray<S2ACPatchItem *> *byKind[3] = {[NSMutableArray new], [NSMutableArray new], [NSMutableArray new]};
     NSMutableDictionary<NSString *, S2ACPatchItem *> *seen = [NSMutableDictionary new];
     NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
-    for (NSUInteger i = 1; i < lines.count; i++) {   // 第一行表头：编号 / 模块 / 位 / 类别 / 段名 / 许可 / 来源 / 数据写入 / 缺省开
+    for (NSUInteger i = 1; i < lines.count; i++) {   // 第一行表头：编号 / 模块 / 位 / 类别 / 段名 / 许可 / 来源 / 数据写入 / 缺省开 / 目标帧率（第 10 列，旧表没有）
         NSArray<NSString *> *c = [lines[i] componentsSeparatedByString:@"\t"];
         if (c.count < 9 || !c[0].length) continue;
-        S2ACPatchItem *it = seen[c[0]];
-        if (it) { it.defaultOn |= [c[8] isEqual:@"1"]; continue; }
+        if ([c[0] hasPrefix:@"cheat:"]) continue;
+        if ([c[0] hasPrefix:@"mod:"]) continue;   // 玩家导入的 mod 带的代码补丁：跟资源 Mod 页的开关走（runtime/src/cpatch.c cp_mod_on），不进画面补丁页
+        if ([c[0] hasPrefix:@"gfx:"] && !(c.count > 13 && [c[13] isEqual:@"load"])) continue;   // 画面类只列降负载的（表第 14 列方向 load，11-16 维护者）；提画质 / 认不出的 iOS 上不打不列（运行时 runtime/src/cpatch.c 同口径）   // 编进包的金手指（pack/cpatch.py scan_cheats）在金手指页开关（ios/vpad_cheats.m → Cheats.cs → s2a_cpatch_cheat），不进画面补丁页
+        // 自适应画幅一族（pack/cpatch.py adapt_families）的宽 / 窄两份只列一项，开关按族编号（runtime/src/cpatch.c 按当前画幅开其一）
+        BOOL adapt = [c[0] hasPrefix:@"wsauto:"];
+        // 定画幅的几份宽屏变体（表第 11 列画幅 > 0，pack/cpatch.py）也只列一项，开关写总编号 widescreen:auto（runtime/src/cpatch.c 按当前屏幕比例开最近的一份）
+        double fa = [c[0] hasPrefix:@"widescreen:"] && c.count > 10 ? c[10].doubleValue : 0;
+        NSString *ident = adapt ? [c[0] substringToIndex:[c[0] rangeOfString:@":" options:NSBackwardsSearch].location] : fa > 0 ? @"widescreen:auto" : c[0];
+        NSString *ratio = fa > 0 ? S2ACPatchRatioText(fa) : nil;
+        S2ACPatchItem *it = seen[ident];
+        if (it) {
+            it.defaultOn |= [c[8] isEqual:@"1"]; if (c.count > 9) it.targetFps = MAX(it.targetFps, c[9].integerValue);
+            if (ratio) it.name = [it.name stringByAppendingFormat:@" / %@", ratio];
+            continue;
+        }
         it = [S2ACPatchItem new];
-        it.ident = c[0]; it.name = c[4].length ? c[4] : c[0]; it.license = c[5]; it.defaultOn = [c[8] isEqual:@"1"];
-        it.group = S2ACPatchClassify(it.name, c[3], c[0]); it.title = S2ACPatchTitle(it.name, it.group);
-        seen[c[0]] = it;
+        it.ident = ident; it.name = ratio ?: c[4].length ? c[4] : c[0]; it.license = c[5]; it.defaultOn = [c[8] isEqual:@"1"];
+        if (c.count > 9) it.targetFps = c[9].integerValue;
+        it.loadDir = [c[0] hasPrefix:@"gfx:"] && c.count > 13 && [c[13] isEqual:@"load"];
+        it.group = adapt || ratio ? @"widescreen" : S2ACPatchClassify(it.name, c[3], c[0]);
+        it.title = adapt ? S2AL(@"cpatch.title.adaptive") : ratio ? S2AL(@"cpatch.title.autoRatio") : S2ACPatchTitle(it.name, it.group);
+        seen[ident] = it;
         int k = [it.group isEqual:@"widescreen"] ? 0 : [it.group isEqual:@"fps"] ? 1 : 2;
         [byKind[k] addObject:it];
     }
@@ -70,7 +94,7 @@ NSArray<S2ACPatchGroup *> *S2ACPatchGroupsFromTSV(NSString *text) {
     for (int k = 0; k < 3; k++) {
         if (!byKind[k].count) continue;
         S2ACPatchGroup *g = [S2ACPatchGroup new];
-        g.kind = kinds[k]; g.title = titles[k]; g.items = byKind[k];
+        g.kind = kinds[k]; g.title = k == 0 ? S2AL(@"cpatch.group.widescreen") : k == 1 ? S2AL(@"cpatch.group.fps") : S2AL(@"cpatch.group.gfx"); g.items = byKind[k];
         [groups addObject:g];
     }
     return groups;
@@ -84,7 +108,7 @@ NSSet<NSString *> *S2ACPatchEnabled(NSArray<S2ACPatchGroup *> *groups, NSUserDef
     NSMutableSet<NSString *> *on = [NSMutableSet new];
     for (S2ACPatchGroup *g in groups)
         for (S2ACPatchItem *it in g.items)
-            if (!it.followsFps60 && (listed ? [listed containsObject:it.ident] : it.defaultOn)) [on addObject:it.ident];
+            if (!it.followsFps60 && (listed ? [listed containsObject:it.ident] : !it.loadDir)) [on addObject:it.ident];   // 没设过 = 开（11-13，同 runtime/src/cpatch.c；defaultOn 只作「我方已验」标签），降负载的画面补丁除外（11-16 缺省关）
     return on;
 }
 
@@ -97,4 +121,14 @@ void S2ACPatchSetEnabled(NSArray<S2ACPatchGroup *> *groups, NSUserDefaults *defa
         for (S2ACPatchItem *it in g.items)
             if ([set containsObject:it.ident]) [out addObject:it.ident];
     [defaults setObject:out forKey:S2ACPatchDefaultsKey];
+}
+
+NSString *S2ACrashTag(NSDictionary *item) { return [NSString stringWithFormat:@"%@\t%@", item[@"kind"], item[@"key"]]; }
+NSArray<NSDictionary *> *S2ACrashNarrow(NSArray<NSDictionary *> *on, NSSet<NSString *> *good) {
+    if (good) {
+        NSArray *fresh = [on filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *it, id _) { return ![good containsObject:S2ACrashTag(it)]; }]];
+        if (fresh.count) return fresh;
+    }
+    NSArray *unv = [on filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *it, id _) { return [it[@"kind"] isEqual:@"cheat"] || ![it[@"verified"] boolValue]; }]];
+    return unv.count ? unv : on;
 }

@@ -109,7 +109,7 @@ final class EngineProviderBuildTests: XCTestCase {
             case "preflight":
                 preflights += 1
                 let ok = preflights > 1 ? "true" : "false"
-                return ([result(#"{"checks":[{"name":"Xcode","ok":true,"requiredFor":["prepare"],"action":"appStoreXcode"},{"name":".NET SDK（打 iPhone 包）","ok":\#(ok),"requiredFor":["ipa"],"action":"installDotnet"}]}"#)], 0, false)
+                return ([result(#"{"checks":[{"id":"xcode","name":"Xcode","ok":true,"requiredFor":["prepare"],"action":"appStoreXcode"},{"id":"dotnet_sdk","name":".NET SDK（打 iPhone 包）","ok":\#(ok),"requiredFor":["ipa"],"action":"installDotnet"}]}"#)], 0, false)
             case "installDotnet": return ([result("{}")], 0, false)
             default: return ([result(#"{"outputPath":"/out/A","ipa":"/out/A/A.ipa","buildId":"abc"}"#)], 0, false)
             }
@@ -138,7 +138,7 @@ final class EngineProviderBuildTests: XCTestCase {
         let runner = FakeRunner()
         runner.script = { req in
             req["operation"] as? String == "preflight"
-                ? ([result(#"{"checks":[{"name":".NET SDK（打 iPhone 包）","ok":false,"requiredFor":["ipa"],"action":"installDotnet"}]}"#)], 0, false)
+                ? ([result(#"{"checks":[{"id":"dotnet_sdk","name":".NET SDK（打 iPhone 包）","ok":false,"requiredFor":["ipa"],"action":"installDotnet"}]}"#)], 0, false)
                 : ([result("{}")], 0, false)
         }
         let provider = S2ArmEngineProvider(client: client(box, runner), xcodeLocator: { nil })
@@ -181,7 +181,7 @@ final class EngineProviderBuildTests: XCTestCase {
 
 final class EngineProviderSettingsAndRunTests: XCTestCase {
     func testSettingsSchemaIsEmpty() throws {
-        // 11-07 维护者 删游戏选项：语言跟系统、Mac 主机模式、60 帧 / 满屏缺省开 + 自动降级，都由作业层定，没有可选的行，也不起作业
+        // 这一层没有可选的行、也不起作业：逐款选项（游戏语言、主机模式等）在启动设置，走作业层 community
         let box = try Sandbox(); defer { box.remove() }
         let runner = FakeRunner()
         let provider = S2ArmEngineProvider(client: client(box, runner), xcodeLocator: { nil })
@@ -242,7 +242,7 @@ final class EnvironmentAndInstallTests: XCTestCase {
         XCTAssertEqual(service.repairStep(for: "downloadMetal"), .job("downloadMetal"))
         XCTAssertEqual(service.repairStep(for: "downloadIosPlatform"), .job("downloadIosPlatform"))   // 11-07：缺 Xcode 的 iOS 平台组件 → 一键下载作业
         XCTAssertEqual(service.repairStep(for: "installDotnet"), .job("installDotnet"))
-        XCTAssertEqual(service.repairStep(for: "library"), .chooseLibrary)   // 游戏库在云盘 / 非 APFS：换游戏库
+        XCTAssertEqual(service.repairStep(for: "library"), .chooseLibrary)   // 游戏库在云盘 / 不支持的盘格式：换游戏库
         XCTAssertEqual(service.repairStep(for: "prepareEngine"), .unavailable)
         XCTAssertFalse(service.ready(for: "prepare"))   // 还没查过算没齐
         // 没找到 Xcode 时「打开 Xcode」退成去 App Store
@@ -259,7 +259,7 @@ final class EnvironmentAndInstallTests: XCTestCase {
         runner.script = { req in
             if req["operation"] as? String == "downloadIosPlatform" { downloaded = true; return ([eventLine("progress", message: "下载 Xcode 的 iOS 平台组件"), result("{}")], 0, false) }
             let ok = downloaded ? "true" : "false"
-            return ([result(#"{"checks":[{"name":"iOS 平台组件","ok":"# + ok + #","requiredFor":["ipa"],"group":"system","action":"downloadIosPlatform"}]}"#)], 0, false)
+            return ([result(#"{"checks":[{"id":"ios_platform","name":"iOS 平台组件","ok":"# + ok + #","requiredFor":["ipa"],"group":"system","action":"downloadIosPlatform"}]}"#)], 0, false)
         }
         let service = EnvironmentService(client: client(box, runner), xcodeLocator: { nil })
         _ = try await service.check()
@@ -275,7 +275,7 @@ final class EnvironmentAndInstallTests: XCTestCase {
         let runner = FakeRunner()
         runner.script = { req in
             req["operation"] as? String == "preflight"
-                ? ([result(#"{"checks":[{"name":"Metal 编译组件","ok":true,"requiredFor":["prepare"],"group":"system"}]}"#)], 0, false)
+                ? ([result(#"{"checks":[{"id":"metal","name":"Metal 编译组件","ok":true,"requiredFor":["prepare"],"group":"system"}]}"#)], 0, false)
                 : ([eventLine("progress", message: "下载 Metal 组件"), result("{}")], 0, false)
         }
         let service = EnvironmentService(client: client(box, runner), xcodeLocator: { nil })
@@ -283,7 +283,7 @@ final class EnvironmentAndInstallTests: XCTestCase {
         let checks = try await service.repair("downloadMetal", events: log.sink)
         XCTAssertEqual(ops(runner), ["downloadMetal", "preflight"])
         XCTAssertEqual(runner.starts[1].request["libraryId"] as? String, "")   // 环境准备不依赖游戏库
-        XCTAssertEqual(checks, [ToolCheck(name: "Metal 编译组件", ok: true, message: "", group: "system", requiredFor: ["prepare"])])
+        XCTAssertEqual(checks, [ToolCheck(id: "metal", name: "Metal 编译组件", ok: true, message: "", group: "system", requiredFor: ["prepare"])])
         XCTAssertTrue(service.ready(for: "prepare"))
         XCTAssertEqual(log.kinds, ["progress", "result"])
         do { _ = try await service.repair("library"); XCTFail() } catch { XCTAssertTrue(error is JobClientError) }
@@ -296,7 +296,7 @@ final class EnvironmentAndInstallTests: XCTestCase {
         runner.script = { req in
             switch req["operation"] as? String {
             case "installCheck":
-                // 作业层说 ready 但有一项没好：按没齐算
+                // 作业层说 ready，没好的是提示项：听作业层的，不把「开始装」关掉
                 return ([result(#"{"gameId":"0100A","ready":true,"device":"维护者 的 iPhone","account":"Team","items":[{"id":"package","ok":true,"waiting":false,"title":"这款游戏的 iPhone 版已经做好","detail":"","who":"app"},{"id":"developerMode","ok":\#(ready),"waiting":false,"title":"iPhone 已打开开发者模式","detail":"在 iPhone 上打开","who":"human"}]}"#)], 0, false)
             default:
                 return ([result(#"{"device":"维护者 的 iPhone","packFiles":12,"outputPath":"/out/A"}"#)], 0, false)
@@ -304,7 +304,7 @@ final class EnvironmentAndInstallTests: XCTestCase {
         }
         let provider = S2ArmEngineProvider(client: client(box, runner), xcodeLocator: { nil })
         let first = try await provider.installReadiness(gameId: "0100A")
-        XCTAssertFalse(first.ready)
+        XCTAssertTrue(first.ready)
         XCTAssertEqual(first.items.map(\.id), ["package", "developerMode"])
         XCTAssertEqual(first.items[1].detail, "在 iPhone 上打开")
         XCTAssertEqual(first.device, "维护者 的 iPhone")
@@ -315,5 +315,9 @@ final class EnvironmentAndInstallTests: XCTestCase {
         XCTAssertEqual(ops(runner), ["installCheck", "installCheck", "install"])
         XCTAssertEqual(runner.starts[2].request["gameId"] as? String, "0100A")
         XCTAssertEqual(installed, InstallResult(device: "维护者 的 iPhone", packFiles: 12, outputPath: "/out/A"))
+        XCTAssertNil(runner.starts[2].request["device"])
+        _ = try await provider.install(gameId: "0100A", teamId: "ABCDE12345", device: "测试 iPhone")
+        XCTAssertEqual(runner.starts[3].request["device"] as? String, "测试 iPhone")
+        XCTAssertEqual(runner.starts[3].request["teamId"] as? String, "ABCDE12345")
     }
 }

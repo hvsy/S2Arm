@@ -6,4 +6,10 @@ native-test-ns2pro:
 	$(BUILD)/tests/ns2_captured_reports
 	$(CC) $(CFLAGS) -Iruntime/ns2pro/include runtime/ns2pro/tests/test_rumble_codec.c runtime/ns2pro/NS2Rumble.c -o $(BUILD)/tests/ns2_rumble_codec
 	$(BUILD)/tests/ns2_rumble_codec
+	$(CC) $(CFLAGS) -Iruntime/ns2pro/include runtime/ns2pro/tests/test_joycon.c $(NS2_CODECS) -o $(BUILD)/tests/ns2_joycon
+	$(BUILD)/tests/ns2_joycon
+	$(CC) $(CFLAGS) -Iruntime/ns2pro/include runtime/ns2pro/tests/test_keep.c $(NS2_CODECS) -o $(BUILD)/tests/ns2_keep
+	$(BUILD)/tests/ns2_keep
+	$(CC) $(CFLAGS) -Iruntime/ns2pro/include runtime/ns2pro/tests/test_bond.c $(NS2_CODECS) -o $(BUILD)/tests/ns2_bond
+	$(BUILD)/tests/ns2_bond
 TEST_TARGETS += native-test-ns2pro

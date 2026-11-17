@@ -11,21 +11,24 @@
 #include <sys/ucontext.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <TargetConditionals.h>
 
 #define FPG 0x4000ull                 // 宿主页
 #define CHUNK (2ull << 20)            // 影子块
 #define NDIR (1u << (S2A_FAR_SPAN_BITS - 21))   // 改写器跳板判「是不是远端」只要一次右移 36 位
 static uint64_t g_lo, g_hi;           // 远端 [lo, hi)
 static uint64_t g_sh_lo, g_sh_hi, g_sh_used;   // 影子区 = 堆区 [lo, hi)：影子块从 hi 往下分（已分 g_sh_used），堆从 lo 往上长（layout.c 乙）
+static uint64_t g_lin;   // 线性影子基址（0 = 分块）：影子 = g_lin + (游戏 − g_lo)，整个远端一次预留地址（不可访问、不占内存），用到才放开。#419
 static uint64_t g_ov_used;   // 堆区装不下后从宿主任意空闲地址分的影子（目录存的是每块差值，影子块放哪都成立；不占堆区，不影响 s2a_far_floor）
 __attribute__((weak)) uint64_t s2a_mem_heap_end(void) { return 0; }   // svc_mem.c；只链本文件的单测没有堆
+__attribute__((weak)) int s2a_guest_map_fixed(uint64_t a, uint64_t len) { (void)a; (void)len; return 1; }   // vawin.c：线性影子块走文件后备（1 = 没开文件后备）
 // 每 2 MiB 游戏块一项「影子 − 游戏」的差值：0 = 没分块（影子在窗口前段、远端在窗口之外，差值不可能为 0）。
 //   改写器的翻译跳板（runtime/rewriter，S2A_FAR_TSV 列的点）与缺页代执行查同一张表：s2a_far_desc = {远端起点, 目录}
 static _Atomic int64_t *g_dir;
 struct { uint64_t lo; _Atomic int64_t *dir; } s2a_far_desc;
 // C# 宿主侧翻译（GuestMemory，接口 v2.13）取同一张表：回 &s2a_far_desc（地址定值；dir 为空 = 远端没开）
 const void *s2a_far_desc_get(void) { return &s2a_far_desc; }
-uint64_t s2a_far_floor(void) { return g_dir ? g_sh_hi - g_sh_used : UINT64_MAX; }
+uint64_t s2a_far_floor(void) { return g_dir ? (g_lin ? g_sh_hi : g_sh_hi - g_sh_used) : UINT64_MAX; }   // 线性影子不占堆区
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 int s2a_far_has(uint64_t a, uint64_t n) { return g_dir && a >= g_lo && a + n <= g_hi && a + n >= a; }
 // 远端的游戏地址必须一碰就缺页：空洞全占成不可访问的保留（不带 MAP_FIXED、核对落点，不盖别人）；已有宿主可访问的映射 = 远端访问会静默读写宿主内存，
@@ -44,6 +47,7 @@ static int fence_far(uint64_t lo, uint64_t hi, uint64_t *fenced) {
     }
     return clash;
 }
+static void far_tick_start(void);
 void s2a_far_set(uint64_t lo, uint64_t hi, uint64_t sh_lo, uint64_t sh_hi) {
     if (hi <= lo || sh_hi <= sh_lo) return;
     if (hi - lo > S2A_FAR_SPAN) hi = lo + S2A_FAR_SPAN;
@@ -52,9 +56,29 @@ void s2a_far_set(uint64_t lo, uint64_t hi, uint64_t sh_lo, uint64_t sh_hi) {
     uint64_t fenced; int clash = fence_far(lo, hi, &fenced);
     // 与宿主可访问的映射重叠（11-01 审计 P1-12）：远端地址碰到那里会静默读写宿主内存，不开远端（目录留空）。伸出窗口的物理映射照旧回内存不足（svc_mem.c va_short）
     if (clash) { free(dir); LOG("【红】远端：远端 %#llx +%llu MB 与宿主可访问的映射重叠 %d 段，不开远端（伸出窗口的映射回内存不足）", (unsigned long long)lo, (unsigned long long)((hi - lo) >> 20), clash); return; }
+    if (g_lin) { munmap((void *)(uintptr_t)g_lin, g_hi - g_lo); g_lin = 0; }   // 再次开远端（单测）：上一份线性预留按旧跨度退
     g_lo = lo; g_hi = hi; g_sh_lo = sh_lo; g_sh_hi = sh_hi & ~(CHUNK - 1); g_dir = dir; s2a_far_desc.lo = lo; s2a_far_desc.dir = dir;
+    // #419：分块影子从堆区顶往下切，后一次映射请求拿到更低的地址——游戏地址相邻、分两次映射的两块在影子里倒过来不相邻，显存池正好跨这两次映射时
+    //   零拷贝缓冲建不起来（nvn_mtl.m pool_host「far shadow is not contiguous」，Mac 约 21 分钟 abort）。Mac 地址空间够：整个远端一次预留线性影子，
+    //   任何游戏相邻的地址影子都相邻，与分几次请求无关。iOS 地址紧（免费签名大地址档上限 63 GiB），照旧分块；S2A_FAR_LINEAR=0 强制分块（单测用）
+#if TARGET_OS_OSX
+    const char *le = getenv("S2A_FAR_LINEAR");
+    if (!le || strcmp(le, "0")) {
+        void *p = mmap(NULL, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, S2A_VMTAG_FD(S2A_VMTAG_FAR), 0);
+        if (p != MAP_FAILED && !((uint64_t)(uintptr_t)p & (CHUNK - 1))) g_lin = (uint64_t)(uintptr_t)p;
+        else if (p != MAP_FAILED) {   // 内核给的不按 2 MiB 对齐：多占 2 MiB 再对齐（影子块与游戏块同对齐，块内偏移一致）
+            munmap(p, hi - lo); p = mmap(NULL, hi - lo + CHUNK, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+            if (p != MAP_FAILED) { uint64_t b = ((uint64_t)(uintptr_t)p + CHUNK - 1) & ~(CHUNK - 1), e = (uint64_t)(uintptr_t)p + hi - lo + CHUNK;
+                if (b > (uint64_t)(uintptr_t)p) munmap(p, b - (uint64_t)(uintptr_t)p);
+                if (e > b + (hi - lo)) munmap((void *)(uintptr_t)(b + (hi - lo)), e - b - (hi - lo));
+                g_lin = b; }
+        }
+        if (!g_lin) LOG("远端：线性影子预留 %llu MB 失败（errno=%d），照旧分块（跨两次映射的显存池可能建不起零拷贝缓冲）", (unsigned long long)((hi - lo) >> 20), errno);
+    }
+#endif
     LOG("远端：开，远端 %#llx +%llu MB 的内容放影子区（与堆共用 %#llx +%llu MB，影子从顶往下 2 MiB 一块），游戏一碰远端地址即缺页代执行并记点；远端空洞占住 %llu MB、与宿主映射重叠 %d 段",
         (unsigned long long)lo, (unsigned long long)((hi - lo) >> 20), (unsigned long long)sh_lo, (unsigned long long)((sh_hi - sh_lo) >> 20), (unsigned long long)(fenced >> 20), clash);
+    far_tick_start();
 }
 // 游戏地址 → 影子地址；没分块回 NULL。[*gbeg, *gend) 回差值相同的连续游戏地址（本块向前后各并一块）：代执行允许的访存范围。
 //   跨块且两块影子不相邻的访存（巫师3 sdk+0x58763c 的 16 字节 stp 正好跨块界）走 s2a_far_fault 里的两页并排槽
@@ -108,12 +132,26 @@ int s2a_far_map(uint64_t a, uint64_t n) {
         LOG("【红】远端：已分块影子页放不开（游戏 %#llx +%#llx，errno=%d），已改的 %d 段退回原保护", (unsigned long long)a, (unsigned long long)n, e, r);
         return -1;
     }
-    if (k) {
+    if (k && g_lin) {   // 线性影子：块位置由游戏地址定，不分配不记账；文件后备时先把块映射成文件（同分块时的规则），再放开请求覆盖的页
+        for (uint64_t i = i0; i <= i1; i++) {
+            if (atomic_load(&g_dir[i])) continue;
+            uint64_t cb = g_lo + i * CHUNK, cs = g_lin + i * CHUNK, lo = a > cb ? a : cb, hi = a + n < cb + CHUNK ? a + n : cb + CHUNK;
+            if (s2a_guest_map_fixed(cs, CHUNK) < 0 || mprotect((void *)(uintptr_t)(cs + (lo - cb)), hi - lo, PROT_READ | PROT_WRITE)) {
+                int e = errno;
+                for (uint64_t u = i0; u <= i; u++) if (!atomic_load(&g_dir[u])) mmap((void *)(uintptr_t)(g_lin + u * CHUNK), CHUNK, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_NORESERVE, -1, 0);   // 盖回预留；没发布过、游戏碰不到
+                runs_undo(rv, rm); free(rv); pthread_mutex_unlock(&g_mu);
+                LOG("【红】远端：线性影子页放不开（游戏 %#llx +%#llx，errno=%d），目录不发布", (unsigned long long)a, (unsigned long long)n, e);
+                return -1;
+            }
+        }
+        for (uint64_t i = i0; i <= i1; i++)
+            if (!atomic_load(&g_dir[i])) atomic_store_explicit(&g_dir[i], (int64_t)(g_lin - g_lo), memory_order_release);
+    } else if (k) {
         int ov = 0;
         uint64_t at = g_sh_hi - g_sh_used - k * CHUNK, he = s2a_mem_heap_end();
         if (g_sh_used + k * CHUNK <= g_sh_hi - g_sh_lo && at >= he) g_sh_used += k * CHUNK;
         else {
-            void *p = s2a_guest_map_any(k * CHUNK); if (p == MAP_FAILED) p = mmap(NULL, k * CHUNK, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);   // 客体内存文件后备时影子块也走文件（vawin.c）
+            void *p = s2a_guest_map_any(k * CHUNK); if (p == MAP_FAILED) p = mmap(NULL, k * CHUNK, PROT_NONE, MAP_PRIVATE | MAP_ANON, S2A_VMTAG_FD(S2A_VMTAG_FAR), 0);   // 客体内存文件后备时影子块也走文件（vawin.c）
             if (p == MAP_FAILED) { int e0 = errno; runs_undo(rv, rm); free(rv); pthread_mutex_unlock(&g_mu); LOG("【红】远端：影子区与堆撞上且宿主地址也占不到（堆顶 %#llx，堆区影子 %llu MB、堆区外 %llu MB，本次要 %llu MB，errno=%d）", (unsigned long long)he, (unsigned long long)(g_sh_used >> 20), (unsigned long long)(g_ov_used >> 20), (unsigned long long)(k * CHUNK >> 20), e0); return -1; }
             if (!g_ov_used) LOG("远端：堆区影子余量用完（堆顶 %#llx，堆区影子 %llu MB），影子块改从宿主任意空闲地址分", (unsigned long long)he, (unsigned long long)(g_sh_used >> 20));
             at = (uint64_t)(uintptr_t)p; g_ov_used += k * CHUNK; ov = 1;
@@ -146,6 +184,29 @@ void s2a_far_release(uint64_t a, uint64_t n) {
 typedef struct { _Atomic uint64_t pc; _Atomic uint64_t n; _Atomic uint32_t cls; _Atomic uint32_t fail; } site_t;
 static site_t g_site[NSLOT];
 static _Atomic uint64_t g_faults, g_emul, g_skip, g_nsite, g_full, g_fail, g_cls_fail[10];
+// 逐秒账（#442 / D-DX74：Mac 大款玩久了内存池落进远端后掉到个位数帧，「慢在缺页代执行」要有直接读数）：远端开着就每秒醒一次，
+//   这一秒有缺页才打一行（游戏没碰远端时不出行，日志不涨）；和 [longframe] / 心跳同在一份日志里按时间对齐看。S2A_FAR_TICK=0 关
+static void *far_tick(void *arg) {
+    (void)arg; pthread_setname_np("s2a-far-tick");
+    uint64_t pf = 0, pe = 0, ps = 0, pfl = 0, pn = 0, sec = 0;
+    for (;;) {
+        sleep(1); sec++;
+        uint64_t f = atomic_load(&g_faults), e = atomic_load(&g_emul), s = atomic_load(&g_skip), fl = atomic_load(&g_fail), n = atomic_load(&g_nsite);
+        if (f != pf)
+            LOG("远端每秒 第 %llu 秒：缺页 %llu、代执行 %llu、跳过 %llu、失败 %llu、新访存点 %llu（累计缺页 %llu、访存点 %llu）", (unsigned long long)sec,
+                (unsigned long long)(f - pf), (unsigned long long)(e - pe), (unsigned long long)(s - ps), (unsigned long long)(fl - pfl), (unsigned long long)(n - pn), (unsigned long long)f, (unsigned long long)n);
+        pf = f; pe = e; ps = s; pfl = fl; pn = n;
+    }
+    return NULL;
+}
+static void far_tick_start(void) {
+    static atomic_flag once = ATOMIC_FLAG_INIT;
+    const char *e = getenv("S2A_FAR_TICK");
+    if ((e && !strcmp(e, "0")) || atomic_flag_test_and_set(&once)) return;
+    pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, far_tick, NULL)) LOG("【黄】远端：逐秒账线程起不来（errno=%d），只在收局 / 崩溃时打总账", errno);
+    pthread_attr_destroy(&a);
+}
 static site_t *site_get(uint64_t pc) {
     uint32_t i = (uint32_t)((pc >> 2) * 0x9E3779B97F4A7C15ull >> 48) & (NSLOT - 1);
     for (uint32_t k = 0; k < NSLOT; k++, i = (i + 1) & (NSLOT - 1)) {
@@ -243,7 +304,7 @@ static uint8_t *pair_slot(const uint8_t *p1, const uint8_t *p2) {
     for (k = 0; k < NXS; k++, i = (i + 1) % NXS) { uintptr_t z = 0, cur = atomic_load(&g_xs[i].tid);
         if (cur == tid || (!cur && atomic_compare_exchange_strong(&g_xs[i].tid, &z, tid)) || z == tid) break; }
     if (k == NXS) return NULL;
-    if (!g_xs[i].p) { void *m = mmap(NULL, 2 * FPG, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0); if (m == MAP_FAILED) return NULL; g_xs[i].p = m; }
+    if (!g_xs[i].p) { void *m = mmap(NULL, 2 * FPG, PROT_NONE, MAP_PRIVATE | MAP_ANON, S2A_VMTAG_FD(S2A_VMTAG_FAR), 0); if (m == MAP_FAILED) return NULL; g_xs[i].p = m; }
     for (int j = 0; j < 2; j++) {
         vm_address_t a = (vm_address_t)(g_xs[i].p + j * FPG); vm_prot_t cur, max;
         if (vm_remap(mach_task_self(), &a, FPG, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)(j ? p2 : p1), FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS
@@ -272,7 +333,11 @@ int s2a_far_fault(void *ctx, uint64_t fa, int w) {
         uint64_t ea = 0, len = 0;
         int ok = w ? s2a_emul_store_regs(insn, &r, delta, lo, hi, NULL, &ea, &len) : s2a_emul_load_regs(insn, &r, delta, lo, hi, NULL, &ea, &len);
         if (!ok && len && len <= FPG && (ea & ~(FPG - 1)) != ((ea + len - 1) & ~(FPG - 1))) {   // 跨页：两页影子并排进槽再试
-            uint64_t pg = ea & ~(FPG - 1); uint8_t *p1 = g2h(pg, NULL, NULL), *p2 = g2h(pg + FPG, NULL, NULL), *sl = p1 && p2 ? pair_slot(p1, p2) : NULL;
+            uint64_t pg = ea & ~(FPG - 1); uint8_t *p1 = g2h(pg, NULL, NULL), *p2 = g2h(pg + FPG, NULL, NULL);
+            // 前一页是窗口的最后一页（远端紧接窗口末尾）：窗口里游戏地址就是宿主地址，拿它本身和远端首页的影子并排。
+            //   11-14 D-52P7：LDR X8,[X10,X11] 读窗口末尾前 4 字节起的 8 字节，后半落进远端首页，原先这一页取不到影子 → 代执行不了 → SIGSEGV（玩 87 分钟后）
+            if (!p1 && p2 && pg + FPG == g_lo) p1 = (uint8_t *)(uintptr_t)pg;
+            uint8_t *sl = p1 && p2 ? pair_slot(p1, p2) : NULL;
             if (sl) { delta = (uint64_t)(uintptr_t)sl - pg; lo = pg; hi = pg + 2 * FPG;
                 ok = w ? s2a_emul_store_regs(insn, &r, delta, lo, hi, NULL, NULL, NULL) : s2a_emul_load_regs(insn, &r, delta, lo, hi, NULL, NULL, NULL); }
         }
@@ -369,7 +434,8 @@ int s2a_far_session_reset(void) {
         }
         g_xs[i].p = NULL; atomic_store(&g_xs[i].tid, 0);
     }
-    if (g_dir) for (uint64_t i = 0; i < NDIR; i++) {
+    if (g_lin) { if (munmap((void *)(uintptr_t)g_lin, g_hi - g_lo)) { LOG("【红】远端线性影子释放失败 errno=%d", errno); return -1; } g_lin = 0; }
+    else if (g_dir) for (uint64_t i = 0; i < NDIR; i++) {
         int64_t delta = atomic_load(&g_dir[i]);
         if (!delta) continue;
         uint64_t shadow = g_lo + i * CHUNK + (uint64_t)delta;
